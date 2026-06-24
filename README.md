@@ -7,10 +7,11 @@ Blog Listener is a Manifest V3 Chrome extension that reads blog posts and articl
 - Detects the most likely article content on blog pages.
 - Skips common non-article text such as dates, captions, bylines, share controls, ads, related posts, and newsletter prompts.
 - Reads the article aloud with play, pause/resume, and stop controls.
+- Highlights the current article block while it is being read.
+- Keeps pause/resume on the active speech position.
 - Adds a compact bottom-left Play button and floating player to the current page.
 - Lets you choose voice, speed, and pitch from the extension popup.
 - Stores speech settings with Chrome sync storage.
-- Runs only on the active tab after you open the extension popup.
 
 ## Load the Extension in Chrome
 
@@ -18,7 +19,7 @@ Blog Listener is a Manifest V3 Chrome extension that reads blog posts and articl
 2. Enable **Developer mode**.
 3. Select **Load unpacked**.
 4. Choose the `dist` folder inside this project: `C:\Users\Pranav\Documents\Projects\VDO-Podcast-\dist`.
-5. Open a blog post, click the Blog Listener extension icon, and press **Play**.
+5. Open or refresh a blog post, then use the red Play button in the bottom-left corner.
 
 ## Build
 

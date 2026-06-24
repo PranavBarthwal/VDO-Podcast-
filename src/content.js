@@ -46,6 +46,9 @@ const ICONS = {
 const state = {
   chunks: [],
   chunkIndex: 0,
+  currentChunkCharIndex: 0,
+  currentUtteranceOffset: 0,
+  totalChars: 0,
   isPlaying: false,
   isPaused: false,
   title: "",
@@ -59,6 +62,7 @@ const state = {
 
 let playerElement = null;
 let currentUtterance = null;
+let highlightedElement = null;
 
 createPlayer();
 
@@ -104,11 +108,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 function playArticle(settings = {}) {
   state.settings = { ...state.settings, ...settings };
 
-  if (speechSynthesis.paused && state.isPaused) {
-    speechSynthesis.resume();
-    state.isPaused = false;
-    state.isPlaying = true;
-    updatePlayer();
+  if (state.isPaused) {
+    resumeArticle();
     return;
   }
 
@@ -121,8 +122,11 @@ function playArticle(settings = {}) {
   stopArticle(false);
   state.sessionId += 1;
   state.title = article.title;
-  state.chunks = splitIntoChunks(article.text);
+  state.chunks = article.chunks;
   state.chunkIndex = 0;
+  state.currentChunkCharIndex = 0;
+  state.currentUtteranceOffset = 0;
+  state.totalChars = article.chunks.reduce((total, chunk) => total + chunk.text.length, 0);
   state.isPlaying = true;
   state.isPaused = false;
   speakNextChunk();
@@ -133,15 +137,34 @@ function pauseArticle() {
     return;
   }
 
-  if (speechSynthesis.paused) {
-    speechSynthesis.resume();
-    state.isPaused = false;
-  } else {
-    speechSynthesis.pause();
+  if (!state.isPaused) {
     state.isPaused = true;
+    speechSynthesis.pause();
   }
 
   updatePlayer();
+}
+
+function resumeArticle() {
+  if (!state.isPlaying || !state.isPaused) {
+    return;
+  }
+
+  state.isPaused = false;
+
+  if (speechSynthesis.paused || speechSynthesis.speaking) {
+    speechSynthesis.resume();
+  }
+
+  updatePlayer();
+
+  window.setTimeout(() => {
+    if (!state.isPlaying || state.isPaused || speechSynthesis.speaking) {
+      return;
+    }
+
+    speakCurrentChunkFromSavedPosition();
+  }, 180);
 }
 
 function stopArticle(hidePlayer = true) {
@@ -151,7 +174,11 @@ function stopArticle(hidePlayer = true) {
   state.isPlaying = false;
   state.isPaused = false;
   state.chunkIndex = 0;
+  state.currentChunkCharIndex = 0;
+  state.currentUtteranceOffset = 0;
+  state.totalChars = 0;
   state.chunks = [];
+  clearReadingHighlight();
 
   if (hidePlayer && playerElement) {
     playerElement.querySelector(".blog-listener-title").textContent = "";
@@ -170,8 +197,33 @@ function speakNextChunk() {
     return;
   }
 
+  const chunk = state.chunks[state.chunkIndex];
+  speakChunk(chunk, 0);
+}
+
+function speakCurrentChunkFromSavedPosition() {
+  if (!state.isPlaying || state.chunkIndex >= state.chunks.length) {
+    return;
+  }
+
+  const chunk = state.chunks[state.chunkIndex];
+  const offset = getResumeOffset(chunk.text, state.currentChunkCharIndex);
+  speakChunk(chunk, offset);
+}
+
+function speakChunk(chunk, offset) {
   const sessionId = state.sessionId;
-  const utterance = new SpeechSynthesisUtterance(state.chunks[state.chunkIndex]);
+  const text = chunk.text.slice(offset).trim();
+
+  if (!text) {
+    state.chunkIndex += 1;
+    state.currentChunkCharIndex = 0;
+    state.currentUtteranceOffset = 0;
+    speakNextChunk();
+    return;
+  }
+
+  const utterance = new SpeechSynthesisUtterance(text);
   const voice = speechSynthesis
     .getVoices()
     .find((availableVoice) => availableVoice.voiceURI === state.settings.voiceURI);
@@ -182,12 +234,25 @@ function speakNextChunk() {
 
   utterance.rate = Number(state.settings.rate) || 1;
   utterance.pitch = Number(state.settings.pitch) || 1;
+  state.currentUtteranceOffset = offset;
+  state.currentChunkCharIndex = offset;
+  setReadingHighlight(chunk.element);
+  utterance.onboundary = (event) => {
+    if (sessionId !== state.sessionId || typeof event.charIndex !== "number") {
+      return;
+    }
+
+    state.currentChunkCharIndex = state.currentUtteranceOffset + event.charIndex;
+    updatePlayer();
+  };
   utterance.onend = () => {
     if (sessionId !== state.sessionId) {
       return;
     }
 
     state.chunkIndex += 1;
+    state.currentChunkCharIndex = 0;
+    state.currentUtteranceOffset = 0;
     speakNextChunk();
   };
   utterance.onerror = () => {
@@ -204,16 +269,29 @@ function speakNextChunk() {
   updatePlayer();
 }
 
+function getResumeOffset(text, charIndex) {
+  if (!charIndex || charIndex <= 0) {
+    return 0;
+  }
+
+  const clampedIndex = Math.min(charIndex, text.length - 1);
+  const previousSpace = text.lastIndexOf(" ", clampedIndex);
+
+  return previousSpace > 0 ? previousSpace + 1 : clampedIndex;
+}
+
 function extractArticle() {
   const title = getReadableText(document.querySelector("h1")) || document.title || "This page";
   const mainCandidate = findBestArticleNode();
-  const text = getCleanArticleText(mainCandidate || document.body);
+  const chunks = getArticleChunks(mainCandidate || document.body);
+  const text = chunks.map((chunk) => chunk.text).join(" ");
   const wordCount = countWords(text);
 
   return {
     title: normalizeText(title),
     text,
-    wordCount
+    wordCount,
+    chunks
   };
 }
 
@@ -251,11 +329,7 @@ function findBestArticleNode() {
     return document.body;
   }
 
-  const wrapper = document.createElement("div");
-  paragraphs.forEach((paragraph) => {
-    wrapper.append(paragraph.cloneNode(true));
-  });
-  return wrapper;
+  return document.body;
 }
 
 function scoreArticleNode(element) {
@@ -269,8 +343,14 @@ function scoreArticleNode(element) {
 }
 
 function getCleanArticleText(root) {
+  return getArticleChunks(root)
+    .map((chunk) => chunk.text)
+    .join(" ");
+}
+
+function getArticleChunks(root) {
   const blocks = Array.from(root.querySelectorAll(READABLE_BLOCK_SELECTOR)).filter(isReadableContentBlock);
-  const texts = [];
+  const chunks = [];
   const seen = new Set();
 
   blocks.forEach((block) => {
@@ -279,15 +359,25 @@ function getCleanArticleText(root) {
 
     if (!seen.has(dedupeKey)) {
       seen.add(dedupeKey);
-      texts.push(text);
+      splitTextIntoChunks(text).forEach((chunkText) => {
+        chunks.push({
+          text: chunkText,
+          element: block
+        });
+      });
     }
   });
 
-  if (texts.length > 0) {
-    return texts.join(" ");
+  if (chunks.length > 0) {
+    return chunks;
   }
 
-  return normalizeText(root.innerText || root.textContent || "");
+  return [
+    {
+      text: normalizeText(root.innerText || root.textContent || ""),
+      element: root
+    }
+  ];
 }
 
 function isReadableContentBlock(element) {
@@ -364,7 +454,7 @@ function shouldSkipText(text) {
   return wordCount <= 10 && lowerText.includes("min read");
 }
 
-function splitIntoChunks(text) {
+function splitTextIntoChunks(text) {
   const sentences = text.match(/[^.!?]+[.!?]+|\S[\s\S]*$/g) || [text];
   const chunks = [];
   let currentChunk = "";
@@ -393,6 +483,7 @@ function createPlayer() {
     playerElement.className = "blog-listener-player blog-listener-idle";
     playerElement.innerHTML = `
       <span class="blog-listener-title"></span>
+      <span class="blog-listener-progress" aria-hidden="true"><span class="blog-listener-progress-fill"></span></span>
       <button class="blog-listener-button blog-listener-primary" type="button" data-action="play" title="Play" aria-label="Play article">${ICONS.play}</button>
       <button class="blog-listener-button blog-listener-stop" type="button" data-action="stop" title="Stop" aria-label="Stop reading">${ICONS.stop}</button>
     `;
@@ -404,7 +495,9 @@ function createPlayer() {
       }
 
       if (button.dataset.action === "play") {
-        if (state.isPlaying) {
+        if (state.isPaused) {
+          resumeArticle();
+        } else if (state.isPlaying) {
           pauseArticle();
         } else {
           playFromPageButton();
@@ -445,6 +538,7 @@ function updatePlayer() {
 
   const playButton = playerElement.querySelector("[data-action='play']");
   const titleElement = playerElement.querySelector(".blog-listener-title");
+  const progressFill = playerElement.querySelector(".blog-listener-progress-fill");
   const isActivelyReading = state.isPlaying && !state.isPaused;
 
   playButton.innerHTML = isActivelyReading ? ICONS.pause : ICONS.play;
@@ -454,9 +548,62 @@ function updatePlayer() {
   if (state.isPlaying && state.chunks.length > 0) {
     playerElement.classList.remove("blog-listener-idle");
     titleElement.textContent = `${state.title} (${state.chunkIndex + 1}/${state.chunks.length})`;
+    progressFill.style.width = `${getProgressPercent()}%`;
   } else if (!titleElement.textContent || titleElement.textContent === state.title) {
     playerElement.classList.add("blog-listener-idle");
+    progressFill.style.width = "0%";
+  } else {
+    progressFill.style.width = "0%";
   }
+}
+
+function getProgressPercent() {
+  if (!state.totalChars) {
+    return 0;
+  }
+
+  const completedChars = state.chunks
+    .slice(0, state.chunkIndex)
+    .reduce((total, chunk) => total + chunk.text.length, 0);
+
+  return Math.min(100, Math.round(((completedChars + state.currentChunkCharIndex) / state.totalChars) * 100));
+}
+
+function setReadingHighlight(element) {
+  if (!element || highlightedElement === element) {
+    return;
+  }
+
+  clearReadingHighlight();
+  highlightedElement = element;
+  highlightedElement.classList.add("blog-listener-reading-highlight");
+  highlightedElement.setAttribute("data-blog-listener-reading", "true");
+
+  if (!isElementComfortablyVisible(highlightedElement)) {
+    highlightedElement.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+      inline: "nearest"
+    });
+  }
+}
+
+function clearReadingHighlight() {
+  if (!highlightedElement) {
+    return;
+  }
+
+  highlightedElement.classList.remove("blog-listener-reading-highlight");
+  highlightedElement.removeAttribute("data-blog-listener-reading");
+  highlightedElement = null;
+}
+
+function isElementComfortablyVisible(element) {
+  const rectangle = element.getBoundingClientRect();
+  const topMargin = 96;
+  const bottomMargin = 140;
+
+  return rectangle.top >= topMargin && rectangle.bottom <= window.innerHeight - bottomMargin;
 }
 
 function normalizeText(value = "") {
