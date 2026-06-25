@@ -6,7 +6,7 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  max-width: min(390px, calc(100vw - 44px));
+  max-width: min(500px, calc(100vw - 44px));
   min-height: 68px;
   padding: 8px;
   border: 1px solid rgba(255, 255, 255, 0.72);
@@ -22,9 +22,16 @@
   backdrop-filter: blur(18px);
 }
 
-.blog-listener-player.blog-listener-idle .blog-listener-title,
+.blog-listener-player.blog-listener-idle .blog-listener-copy,
 .blog-listener-player.blog-listener-idle .blog-listener-progress,
+.blog-listener-player.blog-listener-idle [data-action="rewind"],
+.blog-listener-player.blog-listener-idle [data-action="forward"],
 .blog-listener-player.blog-listener-idle [data-action="stop"] {
+  display: none;
+}
+
+.blog-listener-player:not(.blog-listener-idle) .blog-listener-nudge,
+.blog-listener-player.blog-listener-nudge-hidden .blog-listener-nudge {
   display: none;
 }
 
@@ -38,20 +45,64 @@
   backdrop-filter: none;
 }
 
+.blog-listener-nudge {
+  position: absolute;
+  left: 4px;
+  bottom: 76px;
+  width: max-content;
+  max-width: min(260px, calc(100vw - 36px));
+  padding: 10px 13px;
+  border: 1px solid rgba(255, 255, 255, 0.74);
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(255, 242, 244, 0.96));
+  box-shadow: 0 14px 32px rgba(127, 16, 35, 0.18);
+  color: #8f1028;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+  white-space: nowrap;
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+
+.blog-listener-nudge::after {
+  content: "";
+  position: absolute;
+  left: 24px;
+  bottom: -6px;
+  width: 12px;
+  height: 12px;
+  background: rgba(255, 246, 247, 0.98);
+  border-right: 1px solid rgba(255, 255, 255, 0.74);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.74);
+  transform: rotate(45deg);
+}
+
 .blog-listener-player:hover {
   transform: translateY(-1px);
   box-shadow: 0 22px 54px rgba(190, 18, 60, 0.26), 0 10px 26px rgba(15, 23, 42, 0.18);
+}
+
+.blog-listener-player.blog-listener-ad-mode {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.98), rgba(255, 238, 241, 0.98));
+  box-shadow: 0 22px 54px rgba(225, 29, 72, 0.3), 0 10px 26px rgba(15, 23, 42, 0.18);
 }
 
 .blog-listener-player.blog-listener-idle:hover {
   box-shadow: none;
 }
 
-.blog-listener-title {
+.blog-listener-copy {
+  display: grid;
+  min-width: 0;
+  max-width: 190px;
+  padding-left: 12px;
+}
+
+.blog-listener-title,
+.blog-listener-ad-link {
   overflow: hidden;
   min-width: 0;
-  max-width: 218px;
-  padding-left: 12px;
   white-space: nowrap;
   text-overflow: ellipsis;
   color: #7f1023;
@@ -60,12 +111,47 @@
   letter-spacing: 0;
 }
 
+.blog-listener-ad-label,
+.blog-listener-ad-link {
+  display: none;
+}
+
+.blog-listener-ad-mode .blog-listener-title {
+  display: none;
+}
+
+.blog-listener-ad-mode .blog-listener-ad-label {
+  display: block;
+  margin-bottom: 1px;
+  color: rgba(127, 16, 35, 0.58);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0;
+  line-height: 1.1;
+  text-transform: uppercase;
+}
+
+.blog-listener-ad-mode .blog-listener-ad-link {
+  display: block;
+  color: #b80f2f;
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.15;
+  text-decoration: none;
+}
+
+.blog-listener-ad-mode .blog-listener-ad-link:hover {
+  color: #e11d48;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .blog-listener-progress {
   position: absolute;
   left: 24px;
-  right: 118px;
+  right: 232px;
   bottom: 8px;
-  height: 3px;
+  height: 5px;
   overflow: hidden;
   border-radius: 999px;
   background: rgba(225, 29, 72, 0.12);
@@ -77,7 +163,31 @@
   height: 100%;
   border-radius: inherit;
   background: linear-gradient(90deg, #ff2d55, #b80f2f);
+  position: relative;
+  z-index: 1;
   transition: width 220ms ease;
+}
+
+.blog-listener-ad-mode .blog-listener-progress-fill {
+  background: linear-gradient(90deg, #facc15, #f59e0b);
+}
+
+.blog-listener-ad-markers {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.blog-listener-ad-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: 0;
+  background: #facc15;
+  box-shadow: 0 0 8px rgba(250, 204, 21, 0.55);
+  transform: translateX(-50%);
 }
 
 .blog-listener-button {
@@ -95,6 +205,13 @@
   cursor: pointer;
   box-shadow: inset 0 0 0 1px rgba(225, 29, 72, 0.14), 0 8px 18px rgba(127, 16, 35, 0.14);
   transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease, color 160ms ease;
+}
+
+.blog-listener-secondary {
+  width: 46px;
+  height: 34px;
+  min-width: 46px;
+  color: #b80f2f;
 }
 
 .blog-listener-button:hover {
@@ -137,6 +254,39 @@
   fill: currentColor;
 }
 
+.blog-listener-seek-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 100%;
+  height: 100%;
+}
+
+.blog-listener-seek-label {
+  color: currentColor;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  font-size: 11px;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.blog-listener-seek-chevron {
+  width: 7px;
+  height: 7px;
+  border-top: 2px solid currentColor;
+  border-left: 2px solid currentColor;
+  opacity: 0.82;
+}
+
+.blog-listener-seek-back .blog-listener-seek-chevron {
+  transform: rotate(-45deg);
+}
+
+.blog-listener-seek-forward .blog-listener-seek-chevron {
+  transform: rotate(135deg);
+}
+
 .blog-listener-primary .blog-listener-icon {
   width: 27px;
   height: 27px;
@@ -158,12 +308,18 @@ html .blog-listener-reading-highlight {
     max-width: calc(100vw - 28px);
   }
 
-  .blog-listener-title {
-    max-width: 142px;
+  .blog-listener-nudge {
+    left: 0;
+    max-width: calc(100vw - 28px);
+    white-space: normal;
+  }
+
+  .blog-listener-copy {
+    max-width: 104px;
   }
 
   .blog-listener-progress {
     left: 20px;
-    right: 108px;
+    right: 216px;
   }
 }

@@ -7,6 +7,29 @@ window.__blogListenerLoaded = true;
 
 const MIN_ARTICLE_WORDS = 80;
 const MAX_UTTERANCE_CHARS = 1800;
+const AD_BREAK_INTERVAL = 4;
+const SEEK_SECONDS = 5;
+const ESTIMATED_CHARS_PER_SECOND = 14;
+const SIMULATED_ADS = [
+  {
+    title: "Blog Listener Pro",
+    url: "https://example.com/blog-listener-pro",
+    script:
+      "Quick sponsor break. Blog Listener Pro turns long reads into hands free audio in seconds. Now, back to the article."
+  },
+  {
+    title: "FocusFlow Notes",
+    url: "https://example.com/focusflow-notes",
+    script:
+      "A short message from FocusFlow Notes. Capture ideas while Blog Listener reads the web for you. Your article continues now."
+  },
+  {
+    title: "ReadCast Studio",
+    url: "https://example.com/readcast-studio",
+    script:
+      "Sponsor break from ReadCast Studio. Build smooth text to speech, smart highlights, and podcast style controls. Back to the story."
+  }
+];
 const READABLE_BLOCK_SELECTOR = "p, h2, h3, h4, li, blockquote";
 const IGNORED_CONTENT_SELECTOR = [
   "aside",
@@ -40,17 +63,36 @@ const ICONS = {
     <svg class="blog-listener-icon" viewBox="0 0 24 24" aria-hidden="true">
       <path d="M7.2 6.4h9.6c.5 0 .8.4.8.8v9.6c0 .5-.4.8-.8.8H7.2a.8.8 0 0 1-.8-.8V7.2c0-.5.4-.8.8-.8Z"></path>
     </svg>
+  `,
+  rewind5: `
+    <span class="blog-listener-seek-control blog-listener-seek-back" aria-hidden="true">
+      <span class="blog-listener-seek-chevron"></span>
+      <span class="blog-listener-seek-label">5s</span>
+    </span>
+  `,
+  forward5: `
+    <span class="blog-listener-seek-control blog-listener-seek-forward" aria-hidden="true">
+      <span class="blog-listener-seek-label">5s</span>
+      <span class="blog-listener-seek-chevron"></span>
+    </span>
   `
 };
 
 const state = {
   chunks: [],
+  adMarkerPercents: [],
   chunkIndex: 0,
   currentChunkCharIndex: 0,
   currentUtteranceOffset: 0,
+  currentAdCharIndex: 0,
+  currentAdOffset: 0,
+  currentAdText: "",
+  currentAd: null,
   totalChars: 0,
   isPlaying: false,
   isPaused: false,
+  isAdPlaying: false,
+  adBreaksPlayed: new Set(),
   title: "",
   sessionId: 0,
   settings: {
@@ -63,6 +105,7 @@ const state = {
 let playerElement = null;
 let currentUtterance = null;
 let highlightedElement = null;
+let nudgeTimeoutId = null;
 
 createPlayer();
 
@@ -107,6 +150,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 function playArticle(settings = {}) {
   state.settings = { ...state.settings, ...settings };
+  hideNudge();
 
   if (state.isPaused) {
     resumeArticle();
@@ -123,12 +167,19 @@ function playArticle(settings = {}) {
   state.sessionId += 1;
   state.title = article.title;
   state.chunks = article.chunks;
+  state.adMarkerPercents = getAdMarkerPercents(article.chunks);
   state.chunkIndex = 0;
   state.currentChunkCharIndex = 0;
   state.currentUtteranceOffset = 0;
+  state.currentAdCharIndex = 0;
+  state.currentAdOffset = 0;
+  state.currentAdText = "";
+  state.currentAd = null;
   state.totalChars = article.chunks.reduce((total, chunk) => total + chunk.text.length, 0);
   state.isPlaying = true;
   state.isPaused = false;
+  state.isAdPlaying = false;
+  state.adBreaksPlayed = new Set();
   speakNextChunk();
 }
 
@@ -163,8 +214,69 @@ function resumeArticle() {
       return;
     }
 
-    speakCurrentChunkFromSavedPosition();
+    if (state.isAdPlaying) {
+      speakAdBreak(getResumeOffset(state.currentAdText, state.currentAdCharIndex), state.currentAd);
+    } else {
+      speakCurrentChunkFromSavedPosition();
+    }
   }, 180);
+}
+
+function seekPlayback(direction) {
+  if (!state.isPlaying || state.chunks.length === 0) {
+    return;
+  }
+
+  const wasPaused = state.isPaused;
+  const charDelta = direction * SEEK_SECONDS * ESTIMATED_CHARS_PER_SECOND * getPlaybackRate();
+  state.sessionId += 1;
+  speechSynthesis.cancel();
+  state.isPaused = false;
+
+  if (state.isAdPlaying) {
+    seekAdByCharacters(charDelta, wasPaused);
+  } else {
+    seekArticleByCharacters(charDelta, wasPaused);
+  }
+}
+
+function seekAdByCharacters(charDelta, wasPaused) {
+  const targetOffset = clamp(
+    getResumeOffset(state.currentAdText, state.currentAdCharIndex + charDelta),
+    0,
+    Math.max(0, state.currentAdText.length - 1)
+  );
+
+  if (targetOffset >= state.currentAdText.length - 2) {
+    finishAdBreak();
+    return;
+  }
+
+  if (wasPaused) {
+    state.currentAdCharIndex = targetOffset;
+    state.currentAdOffset = targetOffset;
+    state.isPaused = true;
+    updatePlayer();
+    return;
+  }
+
+  speakAdBreak(targetOffset, state.currentAd);
+}
+
+function seekArticleByCharacters(charDelta, wasPaused) {
+  const target = getArticlePositionFromAbsoluteOffset(getCurrentArticleAbsoluteOffset() + charDelta);
+  state.chunkIndex = target.chunkIndex;
+  state.currentChunkCharIndex = target.charIndex;
+  state.currentUtteranceOffset = target.charIndex;
+
+  if (wasPaused) {
+    state.isPaused = true;
+    setReadingHighlight(state.chunks[state.chunkIndex]?.element);
+    updatePlayer();
+    return;
+  }
+
+  speakCurrentChunkFromSavedPosition();
 }
 
 function stopArticle(hidePlayer = true) {
@@ -176,8 +288,15 @@ function stopArticle(hidePlayer = true) {
   state.chunkIndex = 0;
   state.currentChunkCharIndex = 0;
   state.currentUtteranceOffset = 0;
+  state.currentAdCharIndex = 0;
+  state.currentAdOffset = 0;
+  state.currentAdText = "";
+  state.currentAd = null;
   state.totalChars = 0;
   state.chunks = [];
+  state.adMarkerPercents = [];
+  state.isAdPlaying = false;
+  state.adBreaksPlayed = new Set();
   clearReadingHighlight();
 
   if (hidePlayer && playerElement) {
@@ -194,6 +313,11 @@ function speakNextChunk() {
   if (!state.isPlaying || state.chunkIndex >= state.chunks.length) {
     stopArticle(false);
     setPlayerMessage("Finished");
+    return;
+  }
+
+  if (shouldPlayAdBreak()) {
+    speakAdBreak();
     return;
   }
 
@@ -269,6 +393,86 @@ function speakChunk(chunk, offset) {
   updatePlayer();
 }
 
+function shouldPlayAdBreak() {
+  return (
+    state.chunkIndex > 0 &&
+    state.chunkIndex < state.chunks.length &&
+    state.chunkIndex % AD_BREAK_INTERVAL === 0 &&
+    !state.adBreaksPlayed.has(state.chunkIndex)
+  );
+}
+
+function speakAdBreak(offset = 0, resumeAd = null) {
+  const sessionId = state.sessionId;
+  const ad = resumeAd || state.currentAd || getNextAd();
+  const adText = ad.script;
+  const text = adText.slice(offset).trim();
+
+  if (!text) {
+    finishAdBreak();
+    return;
+  }
+
+  state.isAdPlaying = true;
+  state.currentAd = ad;
+  state.currentAdText = adText;
+  state.currentAdOffset = offset;
+  state.currentAdCharIndex = offset;
+  clearReadingHighlight();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  const voice = speechSynthesis
+    .getVoices()
+    .find((availableVoice) => availableVoice.voiceURI === state.settings.voiceURI);
+
+  if (voice) {
+    utterance.voice = voice;
+  }
+
+  utterance.rate = Math.max(0.85, Number(state.settings.rate) || 1);
+  utterance.pitch = Number(state.settings.pitch) || 1;
+  utterance.onboundary = (event) => {
+    if (sessionId !== state.sessionId || typeof event.charIndex !== "number") {
+      return;
+    }
+
+    state.currentAdCharIndex = state.currentAdOffset + event.charIndex;
+    updatePlayer();
+  };
+  utterance.onend = () => {
+    if (sessionId !== state.sessionId) {
+      return;
+    }
+
+    finishAdBreak();
+  };
+  utterance.onerror = () => {
+    if (sessionId !== state.sessionId) {
+      return;
+    }
+
+    finishAdBreak();
+  };
+
+  currentUtterance = utterance;
+  speechSynthesis.speak(utterance);
+  updatePlayer();
+}
+
+function finishAdBreak() {
+  state.adBreaksPlayed.add(state.chunkIndex);
+  state.isAdPlaying = false;
+  state.currentAdText = "";
+  state.currentAd = null;
+  state.currentAdCharIndex = 0;
+  state.currentAdOffset = 0;
+  speakNextChunk();
+}
+
+function getNextAd() {
+  return SIMULATED_ADS[state.adBreaksPlayed.size % SIMULATED_ADS.length];
+}
+
 function getResumeOffset(text, charIndex) {
   if (!charIndex || charIndex <= 0) {
     return 0;
@@ -278,6 +482,44 @@ function getResumeOffset(text, charIndex) {
   const previousSpace = text.lastIndexOf(" ", clampedIndex);
 
   return previousSpace > 0 ? previousSpace + 1 : clampedIndex;
+}
+
+function getCurrentArticleAbsoluteOffset() {
+  const completedChars = state.chunks
+    .slice(0, state.chunkIndex)
+    .reduce((total, chunk) => total + chunk.text.length, 0);
+
+  return completedChars + state.currentChunkCharIndex;
+}
+
+function getArticlePositionFromAbsoluteOffset(offset) {
+  let remaining = clamp(offset, 0, Math.max(0, state.totalChars - 1));
+
+  for (let index = 0; index < state.chunks.length; index += 1) {
+    const chunkLength = state.chunks[index].text.length;
+
+    if (remaining <= chunkLength) {
+      return {
+        chunkIndex: index,
+        charIndex: getResumeOffset(state.chunks[index].text, remaining)
+      };
+    }
+
+    remaining -= chunkLength;
+  }
+
+  return {
+    chunkIndex: Math.max(0, state.chunks.length - 1),
+    charIndex: 0
+  };
+}
+
+function getPlaybackRate() {
+  return Math.max(0.7, Number(state.settings.rate) || 1);
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function extractArticle() {
@@ -482,9 +724,19 @@ function createPlayer() {
     playerElement = document.createElement("div");
     playerElement.className = "blog-listener-player blog-listener-idle";
     playerElement.innerHTML = `
-      <span class="blog-listener-title"></span>
-      <span class="blog-listener-progress" aria-hidden="true"><span class="blog-listener-progress-fill"></span></span>
+      <span class="blog-listener-nudge">Listen to this blog and save time</span>
+      <span class="blog-listener-copy">
+        <span class="blog-listener-ad-label">Sponsored ad</span>
+        <span class="blog-listener-title"></span>
+        <a class="blog-listener-ad-link" href="#" target="_blank" rel="noopener noreferrer"></a>
+      </span>
+      <span class="blog-listener-progress" aria-hidden="true">
+        <span class="blog-listener-progress-fill"></span>
+        <span class="blog-listener-ad-markers"></span>
+      </span>
+      <button class="blog-listener-button blog-listener-secondary" type="button" data-action="rewind" title="Back 5 seconds" aria-label="Go back 5 seconds">${ICONS.rewind5}</button>
       <button class="blog-listener-button blog-listener-primary" type="button" data-action="play" title="Play" aria-label="Play article">${ICONS.play}</button>
+      <button class="blog-listener-button blog-listener-secondary" type="button" data-action="forward" title="Skip forward 5 seconds" aria-label="Skip forward 5 seconds">${ICONS.forward5}</button>
       <button class="blog-listener-button blog-listener-stop" type="button" data-action="stop" title="Stop" aria-label="Stop reading">${ICONS.stop}</button>
     `;
 
@@ -504,6 +756,14 @@ function createPlayer() {
         }
       }
 
+      if (button.dataset.action === "rewind") {
+        seekPlayback(-1);
+      }
+
+      if (button.dataset.action === "forward") {
+        seekPlayback(1);
+      }
+
       if (button.dataset.action === "pause") {
         pauseArticle();
       }
@@ -514,9 +774,28 @@ function createPlayer() {
     });
 
     document.documentElement.append(playerElement);
+    scheduleNudgeDismissal();
   }
 
   updatePlayer();
+}
+
+function scheduleNudgeDismissal() {
+  if (nudgeTimeoutId) {
+    window.clearTimeout(nudgeTimeoutId);
+  }
+
+  nudgeTimeoutId = window.setTimeout(() => {
+    hideNudge();
+  }, 9000);
+}
+
+function hideNudge() {
+  if (!playerElement) {
+    return;
+  }
+
+  playerElement.classList.add("blog-listener-nudge-hidden");
 }
 
 async function playFromPageButton() {
@@ -538,6 +817,7 @@ function updatePlayer() {
 
   const playButton = playerElement.querySelector("[data-action='play']");
   const titleElement = playerElement.querySelector(".blog-listener-title");
+  const adLinkElement = playerElement.querySelector(".blog-listener-ad-link");
   const progressFill = playerElement.querySelector(".blog-listener-progress-fill");
   const isActivelyReading = state.isPlaying && !state.isPaused;
 
@@ -547,17 +827,39 @@ function updatePlayer() {
 
   if (state.isPlaying && state.chunks.length > 0) {
     playerElement.classList.remove("blog-listener-idle");
-    titleElement.textContent = `${state.title} (${state.chunkIndex + 1}/${state.chunks.length})`;
+    playerElement.classList.toggle("blog-listener-ad-mode", state.isAdPlaying);
+    if (state.isAdPlaying && state.currentAd) {
+      titleElement.textContent = "";
+      adLinkElement.textContent = state.currentAd.title;
+      adLinkElement.href = state.currentAd.url;
+    } else {
+      titleElement.textContent = `${state.title} (${state.chunkIndex + 1}/${state.chunks.length})`;
+      adLinkElement.textContent = "";
+      adLinkElement.removeAttribute("href");
+    }
+    renderAdMarkers();
     progressFill.style.width = `${getProgressPercent()}%`;
   } else if (!titleElement.textContent || titleElement.textContent === state.title) {
     playerElement.classList.add("blog-listener-idle");
+    playerElement.classList.remove("blog-listener-ad-mode");
+    adLinkElement.textContent = "";
+    adLinkElement.removeAttribute("href");
+    renderAdMarkers();
     progressFill.style.width = "0%";
   } else {
+    playerElement.classList.remove("blog-listener-ad-mode");
+    adLinkElement.textContent = "";
+    adLinkElement.removeAttribute("href");
+    renderAdMarkers();
     progressFill.style.width = "0%";
   }
 }
 
 function getProgressPercent() {
+  if (state.isAdPlaying && state.currentAdText) {
+    return Math.min(100, Math.round((state.currentAdCharIndex / state.currentAdText.length) * 100));
+  }
+
   if (!state.totalChars) {
     return 0;
   }
@@ -567,6 +869,42 @@ function getProgressPercent() {
     .reduce((total, chunk) => total + chunk.text.length, 0);
 
   return Math.min(100, Math.round(((completedChars + state.currentChunkCharIndex) / state.totalChars) * 100));
+}
+
+function getAdMarkerPercents(chunks) {
+  const totalChars = chunks.reduce((total, chunk) => total + chunk.text.length, 0);
+
+  if (!totalChars) {
+    return [];
+  }
+
+  return chunks
+    .map((_chunk, index) => index)
+    .filter((index) => index > 0 && index < chunks.length && index % AD_BREAK_INTERVAL === 0)
+    .map((index) => {
+      const completedChars = chunks.slice(0, index).reduce((total, chunk) => total + chunk.text.length, 0);
+      return Math.min(98, Math.max(2, (completedChars / totalChars) * 100));
+    });
+}
+
+function renderAdMarkers() {
+  if (!playerElement) {
+    return;
+  }
+
+  const markerLayer = playerElement.querySelector(".blog-listener-ad-markers");
+  if (!markerLayer) {
+    return;
+  }
+
+  markerLayer.textContent = "";
+  state.adMarkerPercents.forEach((percent) => {
+    const marker = document.createElement("span");
+    marker.className = "blog-listener-ad-marker";
+    marker.style.left = `${percent}%`;
+    marker.title = "Ad break";
+    markerLayer.append(marker);
+  });
 }
 
 function setReadingHighlight(element) {
