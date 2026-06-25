@@ -10,6 +10,7 @@ const MAX_UTTERANCE_CHARS = 1800;
 const AD_BREAK_INTERVAL = 4;
 const SEEK_SECONDS = 5;
 const ESTIMATED_CHARS_PER_SECOND = 14;
+const DEFAULT_WORDS_PER_MINUTE = 175;
 const SIMULATED_ADS = [
   {
     title: "Blog Listener Pro",
@@ -104,10 +105,17 @@ const state = {
 
 let playerElement = null;
 let currentUtterance = null;
-let highlightedElement = null;
+let currentReadingElement = null;
+let wordHighlightElement = null;
+let currentWordHighlight = null;
+let wordHighlightFrameId = null;
+let wordAdvanceTimerId = null;
+let wordAdvanceContext = null;
 let nudgeTimeoutId = null;
 
 createPlayer();
+window.addEventListener("scroll", scheduleWordHighlightReflow, { passive: true });
+window.addEventListener("resize", scheduleWordHighlightReflow);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || !message.type) {
@@ -190,6 +198,7 @@ function pauseArticle() {
 
   if (!state.isPaused) {
     state.isPaused = true;
+    stopWordAdvanceTimer();
     speechSynthesis.pause();
   }
 
@@ -202,6 +211,7 @@ function resumeArticle() {
   }
 
   state.isPaused = false;
+  resumeWordAdvanceTimer();
 
   if (speechSynthesis.paused || speechSynthesis.speaking) {
     speechSynthesis.resume();
@@ -230,6 +240,7 @@ function seekPlayback(direction) {
   const wasPaused = state.isPaused;
   const charDelta = direction * SEEK_SECONDS * ESTIMATED_CHARS_PER_SECOND * getPlaybackRate();
   state.sessionId += 1;
+  stopWordAdvanceTimer();
   speechSynthesis.cancel();
   state.isPaused = false;
 
@@ -271,7 +282,9 @@ function seekArticleByCharacters(charDelta, wasPaused) {
 
   if (wasPaused) {
     state.isPaused = true;
-    setReadingHighlight(state.chunks[state.chunkIndex]?.element);
+    const chunk = state.chunks[state.chunkIndex];
+    setReadingElement(chunk?.element);
+    updateWordHighlight(chunk, state.currentChunkCharIndex);
     updatePlayer();
     return;
   }
@@ -281,6 +294,7 @@ function seekArticleByCharacters(charDelta, wasPaused) {
 
 function stopArticle(hidePlayer = true) {
   state.sessionId += 1;
+  stopWordAdvanceTimer(true);
   speechSynthesis.cancel();
   currentUtterance = null;
   state.isPlaying = false;
@@ -297,7 +311,7 @@ function stopArticle(hidePlayer = true) {
   state.adMarkerPercents = [];
   state.isAdPlaying = false;
   state.adBreaksPlayed = new Set();
-  clearReadingHighlight();
+  clearReadingState();
 
   if (hidePlayer && playerElement) {
     playerElement.querySelector(".blog-listener-title").textContent = "";
@@ -360,13 +374,21 @@ function speakChunk(chunk, offset) {
   utterance.pitch = Number(state.settings.pitch) || 1;
   state.currentUtteranceOffset = offset;
   state.currentChunkCharIndex = offset;
-  setReadingHighlight(chunk.element);
+  setReadingElement(chunk.element);
+  updateWordHighlight(chunk, offset, 1);
+  startWordAdvanceTimer(chunk, offset, sessionId);
   utterance.onboundary = (event) => {
     if (sessionId !== state.sessionId || typeof event.charIndex !== "number") {
       return;
     }
 
     state.currentChunkCharIndex = state.currentUtteranceOffset + event.charIndex;
+    updateWordHighlight(
+      chunk,
+      state.currentChunkCharIndex,
+      event.name === "word" ? event.charLength : 1
+    );
+    syncWordAdvanceTimer(state.currentChunkCharIndex);
     updatePlayer();
   };
   utterance.onend = () => {
@@ -374,6 +396,7 @@ function speakChunk(chunk, offset) {
       return;
     }
 
+    stopWordAdvanceTimer();
     state.chunkIndex += 1;
     state.currentChunkCharIndex = 0;
     state.currentUtteranceOffset = 0;
@@ -384,6 +407,7 @@ function speakChunk(chunk, offset) {
       return;
     }
 
+    stopWordAdvanceTimer();
     stopArticle(false);
     setPlayerMessage("Speech playback stopped");
   };
@@ -414,11 +438,12 @@ function speakAdBreak(offset = 0, resumeAd = null) {
   }
 
   state.isAdPlaying = true;
+  stopWordAdvanceTimer(true);
   state.currentAd = ad;
   state.currentAdText = adText;
   state.currentAdOffset = offset;
   state.currentAdCharIndex = offset;
-  clearReadingHighlight();
+  clearReadingState();
 
   const utterance = new SpeechSynthesisUtterance(text);
   const voice = speechSynthesis
@@ -601,10 +626,11 @@ function getArticleChunks(root) {
 
     if (!seen.has(dedupeKey)) {
       seen.add(dedupeKey);
-      splitTextIntoChunks(text).forEach((chunkText) => {
+      splitTextIntoChunks(text).forEach((chunkPart) => {
         chunks.push({
-          text: chunkText,
-          element: block
+          text: chunkPart.text,
+          element: block,
+          blockOffset: chunkPart.offset
         });
       });
     }
@@ -617,7 +643,8 @@ function getArticleChunks(root) {
   return [
     {
       text: normalizeText(root.innerText || root.textContent || ""),
-      element: root
+      element: root,
+      blockOffset: 0
     }
   ];
 }
@@ -697,23 +724,48 @@ function shouldSkipText(text) {
 }
 
 function splitTextIntoChunks(text) {
-  const sentences = text.match(/[^.!?]+[.!?]+|\S[\s\S]*$/g) || [text];
+  const sentences = Array.from(text.matchAll(/[^.!?]+[.!?]+|\S[\s\S]*$/g));
   const chunks = [];
   let currentChunk = "";
+  let currentOffset = 0;
 
-  sentences.forEach((sentence) => {
-    const nextChunk = `${currentChunk} ${sentence}`.trim();
+  if (sentences.length === 0) {
+    return [{ text, offset: 0 }];
+  }
+
+  sentences.forEach((match) => {
+    const rawSentence = match[0];
+    const sentence = rawSentence.trim();
+    const firstCharacterOffset = rawSentence.search(/\S/);
+    const sentenceOffset = match.index + Math.max(0, firstCharacterOffset);
+
+    if (!sentence) {
+      return;
+    }
+
+    const nextChunk = currentChunk ? `${currentChunk} ${sentence}` : sentence;
 
     if (nextChunk.length > MAX_UTTERANCE_CHARS && currentChunk) {
-      chunks.push(currentChunk);
+      chunks.push({
+        text: currentChunk,
+        offset: currentOffset
+      });
       currentChunk = sentence.trim();
+      currentOffset = sentenceOffset;
     } else {
+      if (!currentChunk) {
+        currentOffset = sentenceOffset;
+      }
+
       currentChunk = nextChunk;
     }
   });
 
   if (currentChunk) {
-    chunks.push(currentChunk);
+    chunks.push({
+      text: currentChunk,
+      offset: currentOffset
+    });
   }
 
   return chunks;
@@ -907,18 +959,16 @@ function renderAdMarkers() {
   });
 }
 
-function setReadingHighlight(element) {
-  if (!element || highlightedElement === element) {
+function setReadingElement(element) {
+  if (!element) {
+    hideWordHighlight();
     return;
   }
 
-  clearReadingHighlight();
-  highlightedElement = element;
-  highlightedElement.classList.add("blog-listener-reading-highlight");
-  highlightedElement.setAttribute("data-blog-listener-reading", "true");
+  currentReadingElement = element;
 
-  if (!isElementComfortablyVisible(highlightedElement)) {
-    highlightedElement.scrollIntoView({
+  if (!isElementComfortablyVisible(currentReadingElement)) {
+    currentReadingElement.scrollIntoView({
       behavior: "smooth",
       block: "center",
       inline: "nearest"
@@ -926,14 +976,268 @@ function setReadingHighlight(element) {
   }
 }
 
-function clearReadingHighlight() {
-  if (!highlightedElement) {
+function clearReadingState() {
+  currentReadingElement = null;
+  hideWordHighlight();
+}
+
+function updateWordHighlight(chunk, chunkCharIndex, charLength = 1, updateContext = true) {
+  if (!chunk?.element || typeof chunkCharIndex !== "number") {
+    hideWordHighlight();
     return;
   }
 
-  highlightedElement.classList.remove("blog-listener-reading-highlight");
-  highlightedElement.removeAttribute("data-blog-listener-reading");
-  highlightedElement = null;
+  if (updateContext) {
+    currentWordHighlight = {
+      chunk,
+      chunkCharIndex,
+      charLength
+    };
+  }
+
+  const wordBounds = getWordBounds(chunk.text, chunkCharIndex, charLength);
+  if (!wordBounds) {
+    hideWordHighlight();
+    return;
+  }
+
+  const blockStart = (chunk.blockOffset || 0) + wordBounds.start;
+  const blockEnd = (chunk.blockOffset || 0) + wordBounds.end;
+  const range = getNormalizedTextRange(chunk.element, blockStart, blockEnd);
+
+  if (!range) {
+    hideWordHighlight();
+    return;
+  }
+
+  const rectangle = Array.from(range.getClientRects()).find((rect) => rect.width > 0 && rect.height > 0);
+  range.detach();
+
+  if (!rectangle) {
+    hideWordHighlight();
+    return;
+  }
+
+  const highlight = getWordHighlightElement();
+  const horizontalPadding = Math.min(8, Math.max(4, rectangle.height * 0.22));
+  const verticalPadding = Math.min(5, Math.max(3, rectangle.height * 0.12));
+
+  highlight.style.left = `${rectangle.left - horizontalPadding}px`;
+  highlight.style.top = `${rectangle.top - verticalPadding}px`;
+  highlight.style.width = `${rectangle.width + horizontalPadding * 2}px`;
+  highlight.style.height = `${rectangle.height + verticalPadding * 2}px`;
+  highlight.hidden = false;
+}
+
+function getWordBounds(text, charIndex, charLength = 1) {
+  if (!text) {
+    return null;
+  }
+
+  let index = clamp(charIndex, 0, Math.max(0, text.length - 1));
+  const explicitEnd = Number.isFinite(charLength) && charLength > 1 ? index + charLength : null;
+
+  while (index < text.length && /\s/.test(text[index])) {
+    index += 1;
+  }
+
+  if (index >= text.length) {
+    index = text.length - 1;
+  }
+
+  let start = index;
+  let end = explicitEnd ? clamp(explicitEnd, index + 1, text.length) : index;
+
+  while (start > 0 && !/\s/.test(text[start - 1])) {
+    start -= 1;
+  }
+
+  while (end < text.length && !/\s/.test(text[end])) {
+    end += 1;
+  }
+
+  if (start === end) {
+    return null;
+  }
+
+  return { start, end };
+}
+
+function getWordRanges(text) {
+  return Array.from(text.matchAll(/\S+/g)).map((match) => ({
+    start: match.index,
+    end: match.index + match[0].length
+  }));
+}
+
+function startWordAdvanceTimer(chunk, offset, sessionId) {
+  stopWordAdvanceTimer();
+
+  const words = getWordRanges(chunk.text).filter((word) => word.end >= offset);
+  if (words.length === 0) {
+    return;
+  }
+
+  const wordIndex = Math.max(0, words.findIndex((word) => word.end >= offset));
+  wordAdvanceContext = {
+    chunk,
+    sessionId,
+    words,
+    wordIndex,
+    intervalMs: getEstimatedWordIntervalMs()
+  };
+
+  updateWordFromAdvanceContext();
+  wordAdvanceTimerId = window.setInterval(() => {
+    if (!wordAdvanceContext || state.sessionId !== wordAdvanceContext.sessionId || state.isPaused || state.isAdPlaying) {
+      return;
+    }
+
+    if (wordAdvanceContext.wordIndex < wordAdvanceContext.words.length - 1) {
+      wordAdvanceContext.wordIndex += 1;
+      updateWordFromAdvanceContext();
+    }
+  }, wordAdvanceContext.intervalMs);
+}
+
+function updateWordFromAdvanceContext() {
+  if (!wordAdvanceContext) {
+    return;
+  }
+
+  const word = wordAdvanceContext.words[wordAdvanceContext.wordIndex];
+  state.currentChunkCharIndex = word.start;
+  updateWordHighlight(wordAdvanceContext.chunk, word.start, word.end - word.start);
+  updatePlayer();
+}
+
+function syncWordAdvanceTimer(charIndex) {
+  if (!wordAdvanceContext) {
+    return;
+  }
+
+  const nextIndex = wordAdvanceContext.words.findIndex((word) => word.end >= charIndex);
+  if (nextIndex >= 0) {
+    wordAdvanceContext.wordIndex = nextIndex;
+  }
+}
+
+function resumeWordAdvanceTimer() {
+  if (!wordAdvanceContext || wordAdvanceTimerId) {
+    return;
+  }
+
+  wordAdvanceTimerId = window.setInterval(() => {
+    if (!wordAdvanceContext || state.sessionId !== wordAdvanceContext.sessionId || state.isPaused || state.isAdPlaying) {
+      return;
+    }
+
+    if (wordAdvanceContext.wordIndex < wordAdvanceContext.words.length - 1) {
+      wordAdvanceContext.wordIndex += 1;
+      updateWordFromAdvanceContext();
+    }
+  }, wordAdvanceContext.intervalMs);
+}
+
+function stopWordAdvanceTimer(clearContext = false) {
+  if (wordAdvanceTimerId) {
+    window.clearInterval(wordAdvanceTimerId);
+    wordAdvanceTimerId = null;
+  }
+
+  if (clearContext) {
+    wordAdvanceContext = null;
+  }
+}
+
+function getEstimatedWordIntervalMs() {
+  const rate = getPlaybackRate();
+  return Math.max(120, Math.round(60000 / (DEFAULT_WORDS_PER_MINUTE * rate)));
+}
+
+function getNormalizedTextRange(root, startIndex, endIndex) {
+  const positions = getNormalizedTextPositions(root);
+  if (positions.length === 0) {
+    return null;
+  }
+
+  const safeStart = clamp(startIndex, 0, positions.length - 1);
+  const safeEnd = clamp(Math.max(endIndex - 1, safeStart), safeStart, positions.length - 1);
+  const startPosition = positions[safeStart];
+  const endPosition = positions[safeEnd];
+  const range = document.createRange();
+
+  try {
+    range.setStart(startPosition.node, startPosition.offset);
+    range.setEnd(endPosition.node, endPosition.offset + 1);
+    return range;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function getNormalizedTextPositions(root) {
+  const positions = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  let lastWasSpace = true;
+
+  while (node) {
+    const value = node.nodeValue || "";
+
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value[index];
+      const isSpace = /\s/.test(character);
+
+      if (isSpace) {
+        if (!lastWasSpace && positions.length > 0) {
+          positions.push({ node, offset: index });
+          lastWasSpace = true;
+        }
+      } else {
+        positions.push({ node, offset: index });
+        lastWasSpace = false;
+      }
+    }
+
+    node = walker.nextNode();
+  }
+
+  return positions;
+}
+
+function getWordHighlightElement() {
+  if (!wordHighlightElement) {
+    wordHighlightElement = document.createElement("div");
+    wordHighlightElement.className = "blog-listener-word-highlight";
+    wordHighlightElement.hidden = true;
+    document.documentElement.append(wordHighlightElement);
+  }
+
+  return wordHighlightElement;
+}
+
+function hideWordHighlight() {
+  currentWordHighlight = null;
+
+  if (wordHighlightElement) {
+    wordHighlightElement.hidden = true;
+  }
+}
+
+function scheduleWordHighlightReflow() {
+  if (!currentWordHighlight || wordHighlightFrameId) {
+    return;
+  }
+
+  wordHighlightFrameId = window.requestAnimationFrame(() => {
+    const highlight = currentWordHighlight;
+    wordHighlightFrameId = null;
+
+    if (highlight) {
+      updateWordHighlight(highlight.chunk, highlight.chunkCharIndex, highlight.charLength);
+    }
+  });
 }
 
 function isElementComfortablyVisible(element) {
