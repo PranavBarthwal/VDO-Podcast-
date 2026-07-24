@@ -11,6 +11,8 @@ const AD_BREAK_INTERVAL = 4;
 const SEEK_SECONDS = 5;
 const ESTIMATED_CHARS_PER_SECOND = 14;
 const DEFAULT_WORDS_PER_MINUTE = 175;
+const MEDIA_USER_INTENT_WINDOW_MS = 1600;
+const ARBITRATION_NOTICE_MS = 3600;
 const SIMULATED_ADS = [
   {
     title: "Blog Listener Pro",
@@ -93,6 +95,7 @@ const state = {
   isPlaying: false,
   isPaused: false,
   isAdPlaying: false,
+  pauseReason: "",
   adBreaksPlayed: new Set(),
   title: "",
   sessionId: 0,
@@ -112,8 +115,11 @@ let wordHighlightFrameId = null;
 let wordAdvanceTimerId = null;
 let wordAdvanceContext = null;
 let nudgeTimeoutId = null;
+let arbitrationNoticeTimeoutId = null;
+let mediaArbitrationController = null;
 
 createPlayer();
+mediaArbitrationController = createMediaArbitrationController();
 window.addEventListener("scroll", scheduleWordHighlightReflow, { passive: true });
 window.addEventListener("resize", scheduleWordHighlightReflow);
 
@@ -156,6 +162,261 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
+function createMediaArbitrationController() {
+  const mediaElements = new Set();
+  const metadata = new WeakMap();
+  let activeMediaElement = null;
+  let lastPageUserIntentAt = 0;
+  let controllerMutating = false;
+
+  document.addEventListener("pointerdown", noteUserMediaIntent, true);
+  document.addEventListener("keydown", noteUserMediaIntent, true);
+  document.addEventListener("touchstart", noteUserMediaIntent, true);
+
+  registerExistingMedia();
+
+  const observer = new MutationObserver((mutations) => {
+    mutations.forEach((mutation) => {
+      mutation.addedNodes.forEach((node) => {
+        if (!(node instanceof Element)) {
+          return;
+        }
+
+        if (isMediaElement(node)) {
+          registerMediaElement(node);
+        }
+
+        node.querySelectorAll?.("audio, video").forEach(registerMediaElement);
+      });
+    });
+  });
+
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+
+  return {
+    requestArticleAudioStart,
+    notifyArticleAudioPaused,
+    notifyArticleAudioStopped
+  };
+
+  function requestArticleAudioStart() {
+    controllerMutating = true;
+
+    mediaElements.forEach((media) => {
+      if (isMediaAudible(media)) {
+        pauseMediaForArticleAudio(media);
+      }
+    });
+
+    activeMediaElement = null;
+    controllerMutating = false;
+    return true;
+  }
+
+  function notifyArticleAudioPaused(reason) {
+    if (reason !== "media") {
+      activeMediaElement = getAudibleMediaElements()[0] || null;
+    }
+  }
+
+  function notifyArticleAudioStopped() {
+    activeMediaElement = getAudibleMediaElements()[0] || null;
+  }
+
+  function registerExistingMedia() {
+    document.querySelectorAll("audio, video").forEach(registerMediaElement);
+  }
+
+  function registerMediaElement(media) {
+    if (mediaElements.has(media)) {
+      return;
+    }
+
+    mediaElements.add(media);
+    metadata.set(media, {
+      lastUserIntentAt: 0,
+      mutedByController: false,
+      pausedByController: false
+    });
+
+    media.addEventListener("play", () => evaluateMediaAudibility(media, "play"), true);
+    media.addEventListener("playing", () => evaluateMediaAudibility(media, "playing"), true);
+    media.addEventListener("volumechange", () => evaluateMediaAudibility(media, "volumechange"), true);
+    media.addEventListener("pause", () => handleMediaInactive(media), true);
+    media.addEventListener("ended", () => handleMediaInactive(media), true);
+
+    evaluateMediaAudibility(media, "register");
+  }
+
+  function noteUserMediaIntent(event) {
+    if (playerElement?.contains(event.target)) {
+      return;
+    }
+
+    lastPageUserIntentAt = Date.now();
+
+    const media = getClosestMediaElement(event.target);
+    if (media) {
+      getMediaMetadata(media).lastUserIntentAt = lastPageUserIntentAt;
+    }
+  }
+
+  function evaluateMediaAudibility(media, cause) {
+    if (controllerMutating || !mediaElements.has(media)) {
+      return;
+    }
+
+    if (!isMediaAudible(media)) {
+      handleMediaInactive(media);
+      return;
+    }
+
+    const userInitiated = hasRecentUserIntent(media);
+    const articleAudioAudible = state.isPlaying && !state.isPaused;
+
+    if (articleAudioAudible) {
+      if (userInitiated) {
+        activeMediaElement = media;
+        pauseArticle({
+          reason: "media",
+          notifyController: false,
+          notice: "Article audio paused - tap play to resume"
+        });
+      } else {
+        preventAutoplaySound(media, cause);
+      }
+
+      return;
+    }
+
+    if (cause === "register") {
+      activeMediaElement = media;
+      return;
+    }
+
+    if (!userInitiated) {
+      preventAutoplaySound(media, cause);
+      return;
+    }
+
+    pauseOtherAudibleMedia(media);
+    activeMediaElement = media;
+  }
+
+  function pauseMediaForArticleAudio(media) {
+    const meta = getMediaMetadata(media);
+    const wasPaused = media.paused;
+
+    try {
+      if (!media.paused) {
+        media.pause();
+        meta.pausedByController = !wasPaused;
+      }
+    } catch (_error) {
+      // Some embedded players throw if pause is blocked by their wrapper.
+    }
+
+    if (!media.muted && media.volume > 0) {
+      media.muted = true;
+      meta.mutedByController = true;
+    }
+  }
+
+  function preventAutoplaySound(media, cause) {
+    const meta = getMediaMetadata(media);
+    controllerMutating = true;
+
+    if (!media.muted) {
+      media.muted = true;
+      meta.mutedByController = true;
+    }
+
+    if (media.tagName.toLowerCase() === "audio") {
+      try {
+        media.pause();
+        meta.pausedByController = true;
+      } catch (_error) {
+        // Keep the controller non-blocking if a site-owned media wrapper rejects pause.
+      }
+    }
+
+    controllerMutating = false;
+
+    if (state.isPlaying && !state.isPaused && cause !== "register") {
+      showArbitrationNotice("Muted autoplay media while article audio plays");
+    }
+  }
+
+  function pauseOtherAudibleMedia(activeMedia) {
+    controllerMutating = true;
+
+    mediaElements.forEach((media) => {
+      if (media === activeMedia || !isMediaAudible(media)) {
+        return;
+      }
+
+      pauseMediaForArticleAudio(media);
+    });
+
+    controllerMutating = false;
+  }
+
+  function handleMediaInactive(media) {
+    if (activeMediaElement === media && !isMediaAudible(media)) {
+      activeMediaElement = null;
+    }
+  }
+
+  function getAudibleMediaElements() {
+    return Array.from(mediaElements).filter(isMediaAudible);
+  }
+
+  function hasRecentUserIntent(media) {
+    const now = Date.now();
+    const meta = getMediaMetadata(media);
+
+    return (
+      now - meta.lastUserIntentAt < MEDIA_USER_INTENT_WINDOW_MS ||
+      now - lastPageUserIntentAt < MEDIA_USER_INTENT_WINDOW_MS
+    );
+  }
+
+  function getMediaMetadata(media) {
+    if (!metadata.has(media)) {
+      metadata.set(media, {
+        lastUserIntentAt: 0,
+        mutedByController: false,
+        pausedByController: false
+      });
+    }
+
+    return metadata.get(media);
+  }
+}
+
+function isMediaElement(value) {
+  return value instanceof HTMLMediaElement;
+}
+
+function getClosestMediaElement(target) {
+  if (!(target instanceof Element)) {
+    return null;
+  }
+
+  if (isMediaElement(target)) {
+    return target;
+  }
+
+  return target.closest?.("audio, video") || null;
+}
+
+function isMediaAudible(media) {
+  return !media.paused && !media.muted && media.volume > 0;
+}
+
 function playArticle(settings = {}) {
   state.settings = { ...state.settings, ...settings };
   hideNudge();
@@ -171,7 +432,11 @@ function playArticle(settings = {}) {
     return;
   }
 
-  stopArticle(false);
+  if (!mediaArbitrationController.requestArticleAudioStart()) {
+    return;
+  }
+
+  stopArticle(false, false);
   state.sessionId += 1;
   state.title = article.title;
   state.chunks = article.chunks;
@@ -187,30 +452,49 @@ function playArticle(settings = {}) {
   state.isPlaying = true;
   state.isPaused = false;
   state.isAdPlaying = false;
+  state.pauseReason = "";
   state.adBreaksPlayed = new Set();
   speakNextChunk();
 }
 
-function pauseArticle() {
+function pauseArticle(options = {}) {
+  const { reason = "user", notifyController = true, notice = "" } = options;
+
   if (!state.isPlaying) {
     return;
   }
 
   if (!state.isPaused) {
     state.isPaused = true;
+    state.pauseReason = reason;
     stopWordAdvanceTimer();
     speechSynthesis.pause();
+  }
+
+  if (notice) {
+    showArbitrationNotice(notice);
+  }
+
+  if (notifyController) {
+    mediaArbitrationController.notifyArticleAudioPaused(reason);
   }
 
   updatePlayer();
 }
 
-function resumeArticle() {
+function resumeArticle(options = {}) {
+  const { skipArbitration = false } = options;
+
   if (!state.isPlaying || !state.isPaused) {
     return;
   }
 
+  if (!skipArbitration && !mediaArbitrationController.requestArticleAudioStart()) {
+    return;
+  }
+
   state.isPaused = false;
+  state.pauseReason = "";
   resumeWordAdvanceTimer();
 
   if (speechSynthesis.paused || speechSynthesis.speaking) {
@@ -292,13 +576,14 @@ function seekArticleByCharacters(charDelta, wasPaused) {
   speakCurrentChunkFromSavedPosition();
 }
 
-function stopArticle(hidePlayer = true) {
+function stopArticle(hidePlayer = true, notifyController = true) {
   state.sessionId += 1;
   stopWordAdvanceTimer(true);
   speechSynthesis.cancel();
   currentUtterance = null;
   state.isPlaying = false;
   state.isPaused = false;
+  state.pauseReason = "";
   state.chunkIndex = 0;
   state.currentChunkCharIndex = 0;
   state.currentUtteranceOffset = 0;
@@ -312,6 +597,10 @@ function stopArticle(hidePlayer = true) {
   state.isAdPlaying = false;
   state.adBreaksPlayed = new Set();
   clearReadingState();
+
+  if (notifyController) {
+    mediaArbitrationController.notifyArticleAudioStopped();
+  }
 
   if (hidePlayer && playerElement) {
     playerElement.querySelector(".blog-listener-title").textContent = "";
@@ -777,6 +1066,7 @@ function createPlayer() {
     playerElement.className = "blog-listener-player blog-listener-idle";
     playerElement.innerHTML = `
       <span class="blog-listener-nudge">Listen to this blog and save time</span>
+      <span class="blog-listener-arbitration-notice"></span>
       <span class="blog-listener-copy">
         <span class="blog-listener-ad-label">Sponsored ad</span>
         <span class="blog-listener-title"></span>
@@ -848,6 +1138,28 @@ function hideNudge() {
   }
 
   playerElement.classList.add("blog-listener-nudge-hidden");
+}
+
+function showArbitrationNotice(message) {
+  if (!playerElement || !message) {
+    return;
+  }
+
+  const notice = playerElement.querySelector(".blog-listener-arbitration-notice");
+  if (!notice) {
+    return;
+  }
+
+  notice.textContent = message;
+  playerElement.classList.add("blog-listener-notice-visible");
+
+  if (arbitrationNoticeTimeoutId) {
+    window.clearTimeout(arbitrationNoticeTimeoutId);
+  }
+
+  arbitrationNoticeTimeoutId = window.setTimeout(() => {
+    playerElement?.classList.remove("blog-listener-notice-visible");
+  }, ARBITRATION_NOTICE_MS);
 }
 
 async function playFromPageButton() {

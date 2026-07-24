@@ -12,6 +12,7 @@ Blog Listener is a Manifest V3 Chrome extension that reads blog posts and articl
 - Keeps pause/resume on the active speech position.
 - Simulates podcast-style sponsored breaks with an ad title and redirect link in the player.
 - Shows upcoming ad breaks as yellow markers on the progress bar.
+- Uses a page-level media arbitration controller so article audio and page video/audio never play audibly at the same time.
 - Adds a compact bottom-left Play button and floating player to the current page.
 - Shows a brief page-load nudge to start listening.
 - Lets you choose voice, speed, and pitch from the extension popup.
@@ -51,3 +52,4 @@ src/
 - Chrome internal pages, extension pages, and restricted browser pages cannot be read.
 - Speech quality and available voices depend on the operating system and browser.
 - Some websites render content lazily. If no article is detected, scroll the page or refresh it before opening the extension.
+- If a user unmutes or plays page media while article audio is active, article audio pauses and can be resumed from the player.
