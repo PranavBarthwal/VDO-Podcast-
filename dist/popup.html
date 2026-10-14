@@ -23,18 +23,22 @@
 
       <section class="settings" aria-label="Speech settings">
         <label for="voiceSelect">Voice</label>
-        <select id="voiceSelect"></select>
+        <select id="voiceSelect" aria-describedby="voiceDescription"></select>
+        <p id="voiceDescription" class="message">Warm, slightly husky</p>
+        <p id="voiceNotice" class="hint">AI voices · Descriptions are approximate.</p>
+        <label for="apiKeyInput">OpenAI API key</label>
+        <input id="apiKeyInput" type="password" autocomplete="off" placeholder="Enter API key">
+        <button id="saveApiKeyButton" type="button">Save API key</button>
 
         <label for="rateInput">Speed <span id="rateValue">1.0x</span></label>
-        <input id="rateInput" type="range" min="0.7" max="1.6" step="0.1" value="1">
+        <input id="rateInput" type="range" min="0.7" max="2" step="0.1" value="1">
 
-        <label for="pitchInput">Pitch <span id="pitchValue">1.0</span></label>
-        <input id="pitchInput" type="range" min="0.7" max="1.4" step="0.1" value="1">
       </section>
 
       <p id="message" class="message" role="status"></p>
     </main>
 
+    <script src="src/voices.js"></script>
     <script src="src/popup.js"></script>
   </body>
 </html>

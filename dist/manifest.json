@@ -3,7 +3,8 @@
   "name": "Blog Listener",
   "description": "Listen to blog posts and article pages with simple playback controls.",
   "version": "0.1.0",
-  "permissions": ["activeTab", "scripting", "storage"],
+  "minimum_chrome_version": "116",
+  "permissions": ["activeTab", "scripting", "storage", "offscreen"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_title": "Blog Listener",
@@ -15,7 +16,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["src/content.js"],
+      "js": ["src/voices.js", "src/audio-player.js", "src/content.js"],
       "css": ["src/content.css"],
       "run_at": "document_idle"
     }

@@ -11,5 +11,6 @@ Copy-Item -Path (Join-Path $projectRoot "manifest.json") -Destination (Join-Path
 Copy-Item -Path (Join-Path $projectRoot "popup.html") -Destination (Join-Path $distPath "popup.html") -Force
 Copy-Item -Path (Join-Path $projectRoot "src\*.js") -Destination $distSrcPath -Force
 Copy-Item -Path (Join-Path $projectRoot "src\*.css") -Destination $distSrcPath -Force
+Copy-Item -Path (Join-Path $projectRoot "src\*.html") -Destination $distSrcPath -Force
 
 Write-Output "Built extension into $distPath"

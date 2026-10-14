@@ -9,8 +9,6 @@ const MIN_ARTICLE_WORDS = 80;
 const MAX_UTTERANCE_CHARS = 1800;
 const AD_BREAK_INTERVAL = 4;
 const SEEK_SECONDS = 5;
-const ESTIMATED_CHARS_PER_SECOND = 14;
-const DEFAULT_WORDS_PER_MINUTE = 175;
 const SIMULATED_ADS = [
   {
     title: "Blog Listener Pro",
@@ -98,24 +96,70 @@ const state = {
   sessionId: 0,
   settings: {
     rate: 1,
-    pitch: 1,
-    voiceURI: ""
+    model: "gpt-4o-mini-tts-2025-12-15",
+    voice: "ash"
   }
 };
 
 let playerElement = null;
-let currentUtterance = null;
 let currentReadingElement = null;
 let wordHighlightElement = null;
 let currentWordHighlight = null;
 let wordHighlightFrameId = null;
-let wordAdvanceTimerId = null;
-let wordAdvanceContext = null;
-let nudgeTimeoutId = null;
+let lastPlaybackMessage = "";
+let lastRenderedWord = null;
+let preloadGeneration = 0;
+let preloadAllowed = true;
+let preloadObserver = null;
+let preloadTimer = null;
+let preloadChecking = false;
+let preloadCheckAgain = false;
+let speechConfigured = null;
+let sessionVoice = "ash";
+let renderedSettings = "";
+
+const speechPlayback = new BlogAudioPlayer({
+  requestAudio: (text, requestId) => chrome.runtime.sendMessage({
+    type: "BLOG_LISTENER_GENERATE_SPEECH", text, requestId, voice: sessionVoice
+  }),
+  cancelRequest: (requestId) => chrome.runtime.sendMessage({
+    type: "BLOG_LISTENER_CANCEL_SPEECH", requestId
+  }),
+  onPosition: (segment, _index, seconds, duration) => {
+    const charIndex = duration ? Math.min(segment.text.length - 1,
+      Math.floor(seconds / duration * segment.text.length)) : 0;
+    const changed = state.chunkIndex !== segment.chunkIndex || state.isAdPlaying !== !!segment.ad;
+    state.chunkIndex = segment.chunkIndex;
+    state.isAdPlaying = !!segment.ad;
+    if (segment.ad) {
+      state.currentAd = segment.ad;
+      state.currentAdText = segment.text;
+      state.currentAdCharIndex = charIndex;
+      if (changed) clearReadingState();
+    } else {
+      state.currentAd = null;
+      state.currentAdText = "";
+      state.currentChunkCharIndex = charIndex;
+      if (changed || currentReadingElement !== segment.element) setReadingElement(segment.element);
+      updateWordHighlight(segment, charIndex, 1);
+    }
+    updatePlayer();
+  },
+  onState: (status) => {
+    state.playbackStatus = status;
+    updatePlayer();
+  },
+  onPreparation: () => updatePlayer(),
+  onFinish: () => { stopArticle(false); setPlayerMessage("Finished"); },
+  onError: (error) => { stopArticle(false); setPlayerMessage(error.message || "Speech playback stopped"); }
+});
 
 createPlayer();
+watchArticleContent();
+preloadArticle();
 window.addEventListener("scroll", scheduleWordHighlightReflow, { passive: true });
 window.addEventListener("resize", scheduleWordHighlightReflow);
+window.addEventListener("pagehide", () => stopArticle(false));
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || !message.type) {
@@ -130,7 +174,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       wordCount: article.wordCount,
       canRead: article.wordCount >= MIN_ARTICLE_WORDS,
       isPlaying: state.isPlaying,
-      isPaused: state.isPaused
+      isPaused: state.isPaused,
+      playbackStatus: state.playbackStatus || "idle",
+      settings: state.settings, voice: sessionVoice,
+      preparation: speechPlayback.getPreparationStatus()
     });
     return false;
   }
@@ -141,8 +188,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return false;
   }
 
+  if (message.type === "BLOG_LISTENER_PRELOAD") {
+    preloadGeneration++;
+    speechConfigured = null;
+    preloadAllowed = true;
+    watchArticleContent();
+    preloadArticle();
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message.type === "BLOG_LISTENER_PAUSE") {
-    pauseArticle();
+    if (state.isPaused) resumeArticle(); else pauseArticle();
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.type === "BLOG_LISTENER_SETTINGS") {
+    applySpeechSettings(message.settings || {});
+    if (!state.isPlaying && preloadAllowed) { preloadGeneration++; preloadArticle(); }
     sendResponse({ ok: true });
     return false;
   }
@@ -156,147 +220,121 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return false;
 });
 
-function playArticle(settings = {}) {
-  state.settings = { ...state.settings, ...settings };
-  hideNudge();
+function articleSegments(article) {
+  const segments = [];
+  let adIndex = 0;
+  let paragraphIndex = -1;
+  let previousElement = null;
+  article.chunks.forEach((chunk, chunkIndex) => {
+    if (chunk.element !== previousElement) paragraphIndex++;
+    previousElement = chunk.element;
+    if (chunkIndex > 0 && chunkIndex % AD_BREAK_INTERVAL === 0) {
+      const ad = SIMULATED_ADS[adIndex++ % SIMULATED_ADS.length];
+      segments.push({ text: ad.script, ad, chunkIndex, paragraphIndex });
+    }
+    segments.push({ ...chunk, chunkIndex, paragraphIndex });
+  });
+  return segments;
+}
 
-  if (state.isPaused) {
-    resumeArticle();
-    return;
+function watchArticleContent() {
+  if (preloadObserver || !document.body) return;
+  const isReaderNode = (node) => {
+    const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    return element && (element === playerElement || playerElement?.contains(element) ||
+      element === wordHighlightElement || wordHighlightElement?.contains(element));
+  };
+  preloadObserver = new MutationObserver((records) => {
+    if (!preloadAllowed || state.isPlaying) return;
+    const articleChanged = records.some((record) => {
+      if (isReaderNode(record.target)) return false;
+      if (record.type === "characterData") return !!record.target.parentElement?.closest(READABLE_BLOCK_SELECTOR);
+      return [...record.addedNodes, ...record.removedNodes].some((node) => !isReaderNode(node) &&
+        (node.nodeType === Node.TEXT_NODE || (node.nodeType === Node.ELEMENT_NODE &&
+          (node.matches(READABLE_BLOCK_SELECTOR) || node.querySelector(READABLE_BLOCK_SELECTOR)))));
+    });
+    if (articleChanged && preloadTimer === null) {
+      preloadTimer = window.setTimeout(() => { preloadTimer = null; preloadArticle(); }, 200);
+    }
+  });
+  preloadObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+}
+
+async function preloadArticle() {
+  if (!preloadAllowed || state.isPlaying) return;
+  if (preloadChecking) { preloadCheckAgain = true; return; }
+  preloadChecking = true;
+  const generation = preloadGeneration;
+  try {
+    const { speechSettings } = await chrome.storage.sync.get("speechSettings");
+    if (generation !== preloadGeneration || state.isPlaying || !preloadAllowed) return;
+    applySpeechSettings(speechSettings || {});
+    if (speechConfigured === null) {
+      const config = await chrome.runtime.sendMessage({ type: "BLOG_LISTENER_SPEECH_CONFIG" });
+      if (generation !== preloadGeneration) return;
+      speechConfigured = !!config?.configured;
+    }
+    if (!speechConfigured || generation !== preloadGeneration || state.isPlaying || !preloadAllowed) return;
+    const article = extractArticle();
+    if (article.wordCount < MIN_ARTICLE_WORDS) return;
+    speechPlayback.refreshPreparation(articleSegments(article), getPlaybackRate());
+  } catch (_error) {
+    // Missing configuration or preload errors must not interrupt browsing.
+  } finally {
+    preloadChecking = false;
+    if (preloadCheckAgain) { preloadCheckAgain = false; preloadArticle(); }
   }
+}
 
+function playArticle(settings = {}) {
+  applySpeechSettings(settings);
+  if (state.isPaused) { resumeArticle(); return; }
+  if (state.isPlaying) return;
   const article = extractArticle();
   if (article.wordCount < MIN_ARTICLE_WORDS) {
     setPlayerMessage("No readable article found");
     return;
   }
-
-  stopArticle(false);
-  state.sessionId += 1;
+  preloadGeneration++;
+  speechPlayback.refreshPreparation(articleSegments(article), getPlaybackRate());
+  state.sessionId++;
   state.title = article.title;
   state.chunks = article.chunks;
   state.adMarkerPercents = getAdMarkerPercents(article.chunks);
-  state.chunkIndex = 0;
-  state.currentChunkCharIndex = 0;
-  state.currentUtteranceOffset = 0;
-  state.currentAdCharIndex = 0;
-  state.currentAdOffset = 0;
-  state.currentAdText = "";
-  state.currentAd = null;
-  state.totalChars = article.chunks.reduce((total, chunk) => total + chunk.text.length, 0);
+  state.totalChars = article.chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
   state.isPlaying = true;
-  state.isPaused = false;
-  state.isAdPlaying = false;
-  state.adBreaksPlayed = new Set();
-  speakNextChunk();
+  speechPlayback.startPrepared(getPlaybackRate());
+  updatePlayer();
 }
 
 function pauseArticle() {
-  if (!state.isPlaying) {
-    return;
-  }
-
-  if (!state.isPaused) {
-    state.isPaused = true;
-    stopWordAdvanceTimer();
-    speechSynthesis.pause();
-  }
-
+  if (!state.isPlaying || state.isPaused) return;
+  state.isPaused = true;
+  speechPlayback.pause();
   updatePlayer();
 }
 
 function resumeArticle() {
-  if (!state.isPlaying || !state.isPaused) {
-    return;
-  }
-
+  if (!state.isPlaying || !state.isPaused) return;
   state.isPaused = false;
-  resumeWordAdvanceTimer();
-
-  if (speechSynthesis.paused || speechSynthesis.speaking) {
-    speechSynthesis.resume();
-  }
-
+  speechPlayback.resume();
   updatePlayer();
-
-  window.setTimeout(() => {
-    if (!state.isPlaying || state.isPaused || speechSynthesis.speaking) {
-      return;
-    }
-
-    if (state.isAdPlaying) {
-      speakAdBreak(getResumeOffset(state.currentAdText, state.currentAdCharIndex), state.currentAd);
-    } else {
-      speakCurrentChunkFromSavedPosition();
-    }
-  }, 180);
 }
 
 function seekPlayback(direction) {
-  if (!state.isPlaying || state.chunks.length === 0) {
-    return;
-  }
-
-  const wasPaused = state.isPaused;
-  const charDelta = direction * SEEK_SECONDS * ESTIMATED_CHARS_PER_SECOND * getPlaybackRate();
-  state.sessionId += 1;
-  stopWordAdvanceTimer();
-  speechSynthesis.cancel();
-  state.isPaused = false;
-
-  if (state.isAdPlaying) {
-    seekAdByCharacters(charDelta, wasPaused);
-  } else {
-    seekArticleByCharacters(charDelta, wasPaused);
-  }
-}
-
-function seekAdByCharacters(charDelta, wasPaused) {
-  const targetOffset = clamp(
-    getResumeOffset(state.currentAdText, state.currentAdCharIndex + charDelta),
-    0,
-    Math.max(0, state.currentAdText.length - 1)
-  );
-
-  if (targetOffset >= state.currentAdText.length - 2) {
-    finishAdBreak();
-    return;
-  }
-
-  if (wasPaused) {
-    state.currentAdCharIndex = targetOffset;
-    state.currentAdOffset = targetOffset;
-    state.isPaused = true;
-    updatePlayer();
-    return;
-  }
-
-  speakAdBreak(targetOffset, state.currentAd);
-}
-
-function seekArticleByCharacters(charDelta, wasPaused) {
-  const target = getArticlePositionFromAbsoluteOffset(getCurrentArticleAbsoluteOffset() + charDelta);
-  state.chunkIndex = target.chunkIndex;
-  state.currentChunkCharIndex = target.charIndex;
-  state.currentUtteranceOffset = target.charIndex;
-
-  if (wasPaused) {
-    state.isPaused = true;
-    const chunk = state.chunks[state.chunkIndex];
-    setReadingElement(chunk?.element);
-    updateWordHighlight(chunk, state.currentChunkCharIndex);
-    updatePlayer();
-    return;
-  }
-
-  speakCurrentChunkFromSavedPosition();
+  if (state.isPlaying) speechPlayback.seek(direction * SEEK_SECONDS);
 }
 
 function stopArticle(hidePlayer = true) {
+  if (playerElement) setSettingsOpen(false, false);
+  preloadAllowed = false;
+  preloadObserver?.disconnect();
+  preloadObserver = null;
+  if (preloadTimer !== null) window.clearTimeout(preloadTimer);
+  preloadTimer = null;
+  preloadGeneration++;
   state.sessionId += 1;
-  stopWordAdvanceTimer(true);
-  speechSynthesis.cancel();
-  currentUtterance = null;
+  speechPlayback.stop();
   state.isPlaying = false;
   state.isPaused = false;
   state.chunkIndex = 0;
@@ -323,224 +361,34 @@ function stopArticle(hidePlayer = true) {
   updatePlayer();
 }
 
-function speakNextChunk() {
-  if (!state.isPlaying || state.chunkIndex >= state.chunks.length) {
-    stopArticle(false);
-    setPlayerMessage("Finished");
-    return;
-  }
 
-  if (shouldPlayAdBreak()) {
-    speakAdBreak();
-    return;
-  }
-
-  const chunk = state.chunks[state.chunkIndex];
-  speakChunk(chunk, 0);
-}
-
-function speakCurrentChunkFromSavedPosition() {
-  if (!state.isPlaying || state.chunkIndex >= state.chunks.length) {
-    return;
-  }
-
-  const chunk = state.chunks[state.chunkIndex];
-  const offset = getResumeOffset(chunk.text, state.currentChunkCharIndex);
-  speakChunk(chunk, offset);
-}
-
-function speakChunk(chunk, offset) {
-  const sessionId = state.sessionId;
-  const text = chunk.text.slice(offset).trim();
-
-  if (!text) {
-    state.chunkIndex += 1;
-    state.currentChunkCharIndex = 0;
-    state.currentUtteranceOffset = 0;
-    speakNextChunk();
-    return;
-  }
-
-  const utterance = new SpeechSynthesisUtterance(text);
-  const voice = speechSynthesis
-    .getVoices()
-    .find((availableVoice) => availableVoice.voiceURI === state.settings.voiceURI);
-
-  if (voice) {
-    utterance.voice = voice;
-  }
-
-  utterance.rate = Number(state.settings.rate) || 1;
-  utterance.pitch = Number(state.settings.pitch) || 1;
-  state.currentUtteranceOffset = offset;
-  state.currentChunkCharIndex = offset;
-  setReadingElement(chunk.element);
-  updateWordHighlight(chunk, offset, 1);
-  startWordAdvanceTimer(chunk, offset, sessionId);
-  utterance.onboundary = (event) => {
-    if (sessionId !== state.sessionId || typeof event.charIndex !== "number") {
-      return;
-    }
-
-    state.currentChunkCharIndex = state.currentUtteranceOffset + event.charIndex;
-    updateWordHighlight(
-      chunk,
-      state.currentChunkCharIndex,
-      event.name === "word" ? event.charLength : 1
-    );
-    syncWordAdvanceTimer(state.currentChunkCharIndex);
-    updatePlayer();
-  };
-  utterance.onend = () => {
-    if (sessionId !== state.sessionId) {
-      return;
-    }
-
-    stopWordAdvanceTimer();
-    state.chunkIndex += 1;
-    state.currentChunkCharIndex = 0;
-    state.currentUtteranceOffset = 0;
-    speakNextChunk();
-  };
-  utterance.onerror = () => {
-    if (sessionId !== state.sessionId) {
-      return;
-    }
-
-    stopWordAdvanceTimer();
-    stopArticle(false);
-    setPlayerMessage("Speech playback stopped");
-  };
-
-  currentUtterance = utterance;
-  speechSynthesis.speak(utterance);
-  updatePlayer();
-}
-
-function shouldPlayAdBreak() {
-  return (
-    state.chunkIndex > 0 &&
-    state.chunkIndex < state.chunks.length &&
-    state.chunkIndex % AD_BREAK_INTERVAL === 0 &&
-    !state.adBreaksPlayed.has(state.chunkIndex)
-  );
-}
-
-function speakAdBreak(offset = 0, resumeAd = null) {
-  const sessionId = state.sessionId;
-  const ad = resumeAd || state.currentAd || getNextAd();
-  const adText = ad.script;
-  const text = adText.slice(offset).trim();
-
-  if (!text) {
-    finishAdBreak();
-    return;
-  }
-
-  state.isAdPlaying = true;
-  stopWordAdvanceTimer(true);
-  state.currentAd = ad;
-  state.currentAdText = adText;
-  state.currentAdOffset = offset;
-  state.currentAdCharIndex = offset;
-  clearReadingState();
-
-  const utterance = new SpeechSynthesisUtterance(text);
-  const voice = speechSynthesis
-    .getVoices()
-    .find((availableVoice) => availableVoice.voiceURI === state.settings.voiceURI);
-
-  if (voice) {
-    utterance.voice = voice;
-  }
-
-  utterance.rate = Math.max(0.85, Number(state.settings.rate) || 1);
-  utterance.pitch = Number(state.settings.pitch) || 1;
-  utterance.onboundary = (event) => {
-    if (sessionId !== state.sessionId || typeof event.charIndex !== "number") {
-      return;
-    }
-
-    state.currentAdCharIndex = state.currentAdOffset + event.charIndex;
-    updatePlayer();
-  };
-  utterance.onend = () => {
-    if (sessionId !== state.sessionId) {
-      return;
-    }
-
-    finishAdBreak();
-  };
-  utterance.onerror = () => {
-    if (sessionId !== state.sessionId) {
-      return;
-    }
-
-    finishAdBreak();
-  };
-
-  currentUtterance = utterance;
-  speechSynthesis.speak(utterance);
-  updatePlayer();
-}
-
-function finishAdBreak() {
-  state.adBreaksPlayed.add(state.chunkIndex);
-  state.isAdPlaying = false;
-  state.currentAdText = "";
-  state.currentAd = null;
-  state.currentAdCharIndex = 0;
-  state.currentAdOffset = 0;
-  speakNextChunk();
-}
-
-function getNextAd() {
-  return SIMULATED_ADS[state.adBreaksPlayed.size % SIMULATED_ADS.length];
-}
-
-function getResumeOffset(text, charIndex) {
-  if (!charIndex || charIndex <= 0) {
-    return 0;
-  }
-
-  const clampedIndex = Math.min(charIndex, text.length - 1);
-  const previousSpace = text.lastIndexOf(" ", clampedIndex);
-
-  return previousSpace > 0 ? previousSpace + 1 : clampedIndex;
-}
-
-function getCurrentArticleAbsoluteOffset() {
-  const completedChars = state.chunks
-    .slice(0, state.chunkIndex)
-    .reduce((total, chunk) => total + chunk.text.length, 0);
-
-  return completedChars + state.currentChunkCharIndex;
-}
-
-function getArticlePositionFromAbsoluteOffset(offset) {
-  let remaining = clamp(offset, 0, Math.max(0, state.totalChars - 1));
-
-  for (let index = 0; index < state.chunks.length; index += 1) {
-    const chunkLength = state.chunks[index].text.length;
-
-    if (remaining <= chunkLength) {
-      return {
-        chunkIndex: index,
-        charIndex: getResumeOffset(state.chunks[index].text, remaining)
-      };
-    }
-
-    remaining -= chunkLength;
-  }
-
-  return {
-    chunkIndex: Math.max(0, state.chunks.length - 1),
-    charIndex: 0
-  };
-}
 
 function getPlaybackRate() {
-  return Math.max(0.7, Number(state.settings.rate) || 1);
+  return Math.min(2, Math.max(0.7, Number(state.settings.rate) || 1));
+}
+
+function applySpeechSettings(settings) {
+  state.settings = { ...state.settings, ...settings, model: "gpt-4o-mini-tts-2025-12-15" };
+  if (!BlogListenerVoices.some((voice) => voice.id === state.settings.voice)) state.settings.voice = "ash";
+  state.settings.rate = getPlaybackRate();
+  // Keep one voice per listening session so cached paragraphs never mix voices.
+  if (!state.isPlaying && sessionVoice !== state.settings.voice) {
+    speechPlayback.stop();
+    sessionVoice = state.settings.voice;
+  }
+  speechPlayback.setRate(state.settings.rate);
+  updatePlayer();
+}
+
+async function changeWidgetSettings(changes) {
+  const settings = { ...state.settings, ...changes };
+  try {
+    await chrome.storage.sync.set({ speechSettings: settings });
+    applySpeechSettings(settings);
+    if (changes.voice && !state.isPlaying && preloadAllowed) { preloadGeneration++; preloadArticle(); }
+  } catch (_error) {
+    playerElement.querySelector(".blog-listener-settings-note").textContent = "Could not save settings. Please try again.";
+  }
 }
 
 function clamp(value, min, max) {
@@ -640,13 +488,8 @@ function getArticleChunks(root) {
     return chunks;
   }
 
-  return [
-    {
-      text: normalizeText(root.innerText || root.textContent || ""),
-      element: root,
-      blockOffset: 0
-    }
-  ];
+  return splitTextIntoChunks(normalizeText(root.innerText || root.textContent || ""))
+    .map((part) => ({ text: part.text, element: root, blockOffset: part.offset }));
 }
 
 function isReadableContentBlock(element) {
@@ -724,50 +567,23 @@ function shouldSkipText(text) {
 }
 
 function splitTextIntoChunks(text) {
-  const sentences = Array.from(text.matchAll(/[^.!?]+[.!?]+|\S[\s\S]*$/g));
   const chunks = [];
-  let currentChunk = "";
-  let currentOffset = 0;
-
-  if (sentences.length === 0) {
-    return [{ text, offset: 0 }];
-  }
-
-  sentences.forEach((match) => {
-    const rawSentence = match[0];
-    const sentence = rawSentence.trim();
-    const firstCharacterOffset = rawSentence.search(/\S/);
-    const sentenceOffset = match.index + Math.max(0, firstCharacterOffset);
-
-    if (!sentence) {
-      return;
+  let start = 0;
+  while (start < text.length) {
+    while (/\s/.test(text[start] || "") && start < text.length) start++;
+    if (start >= text.length) break;
+    let end = Math.min(start + MAX_UTTERANCE_CHARS, text.length);
+    if (end < text.length) {
+      const window = text.slice(start, end);
+      const boundaries = [...window.matchAll(/[.!?](?:\s|$)/g)];
+      const sentenceEnd = boundaries.at(-1);
+      const wordEnd = window.lastIndexOf(" ");
+      if (sentenceEnd && sentenceEnd.index > MAX_UTTERANCE_CHARS / 2) end = start + sentenceEnd.index + 1;
+      else if (wordEnd > 0) end = start + wordEnd;
     }
-
-    const nextChunk = currentChunk ? `${currentChunk} ${sentence}` : sentence;
-
-    if (nextChunk.length > MAX_UTTERANCE_CHARS && currentChunk) {
-      chunks.push({
-        text: currentChunk,
-        offset: currentOffset
-      });
-      currentChunk = sentence.trim();
-      currentOffset = sentenceOffset;
-    } else {
-      if (!currentChunk) {
-        currentOffset = sentenceOffset;
-      }
-
-      currentChunk = nextChunk;
-    }
-  });
-
-  if (currentChunk) {
-    chunks.push({
-      text: currentChunk,
-      offset: currentOffset
-    });
+    chunks.push({ text: text.slice(start, end).trim(), offset: start });
+    start = end;
   }
-
   return chunks;
 }
 
@@ -776,12 +592,14 @@ function createPlayer() {
     playerElement = document.createElement("div");
     playerElement.className = "blog-listener-player blog-listener-idle";
     playerElement.innerHTML = `
-      <span class="blog-listener-nudge">Listen to this blog and save time</span>
+      <span class="blog-listener-nudge">Listen to this article?</span>
       <span class="blog-listener-copy">
+        <span class="blog-listener-meta">AI narration</span>
         <span class="blog-listener-ad-label">Sponsored ad</span>
         <span class="blog-listener-title"></span>
         <a class="blog-listener-ad-link" href="#" target="_blank" rel="noopener noreferrer"></a>
       </span>
+      <span class="blog-listener-playback-status" role="status"></span>
       <span class="blog-listener-progress" aria-hidden="true">
         <span class="blog-listener-progress-fill"></span>
         <span class="blog-listener-ad-markers"></span>
@@ -789,13 +607,44 @@ function createPlayer() {
       <button class="blog-listener-button blog-listener-secondary" type="button" data-action="rewind" title="Back 5 seconds" aria-label="Go back 5 seconds">${ICONS.rewind5}</button>
       <button class="blog-listener-button blog-listener-primary" type="button" data-action="play" title="Play" aria-label="Play article">${ICONS.play}</button>
       <button class="blog-listener-button blog-listener-secondary" type="button" data-action="forward" title="Skip forward 5 seconds" aria-label="Skip forward 5 seconds">${ICONS.forward5}</button>
+      <button class="blog-listener-button blog-listener-settings-toggle" type="button" data-action="settings" title="Speed and voice" aria-label="Speed and voice settings" aria-expanded="false" aria-controls="blog-listener-settings">1×</button>
       <button class="blog-listener-button blog-listener-stop" type="button" data-action="stop" title="Stop" aria-label="Stop reading">${ICONS.stop}</button>
+      <section class="blog-listener-settings" id="blog-listener-settings" aria-label="Listening settings" hidden>
+        <div class="blog-listener-panel-heading"><strong>Listening settings</strong><button class="blog-listener-button" type="button" data-action="close-settings" aria-label="Close settings">×</button></div>
+        <div class="blog-listener-speed-row"><span>Speed</span><div class="blog-listener-stepper">
+          <button class="blog-listener-button" type="button" data-action="slower" aria-label="Decrease speed">−</button>
+          <output class="blog-listener-rate" aria-live="polite">1.0×</output>
+          <button class="blog-listener-button" type="button" data-action="faster" aria-label="Increase speed">+</button>
+        </div></div>
+        <div class="blog-listener-voice-heading">Voice <span>AI narration</span></div>
+        <div class="blog-listener-voices" role="radiogroup" aria-label="Narration voice">
+          ${BlogListenerVoices.map((voice) => `<label class="blog-listener-voice-option"><input type="radio" name="blog-listener-voice" value="${voice.id}"><span><strong>${voice.name}</strong><small>${voice.description}</small></span><span class="blog-listener-voice-check" aria-hidden="true">✓</span></label>`).join("")}
+        </div>
+        <p class="blog-listener-settings-note">Voice descriptions are approximate.</p>
+      </section>
     `;
+
+    playerElement.addEventListener("change", (event) => {
+      if (event.target.matches("input[name='blog-listener-voice']")) changeWidgetSettings({ voice: event.target.value });
+    });
+    playerElement.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") { setSettingsOpen(false); event.stopPropagation(); }
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (!playerElement.contains(event.target)) setSettingsOpen(false, false);
+    });
 
     playerElement.addEventListener("click", (event) => {
       const button = event.target.closest("button[data-action]");
       if (!button) {
         return;
+      }
+
+      if (button.dataset.action === "settings") setSettingsOpen(button.getAttribute("aria-expanded") !== "true");
+      if (button.dataset.action === "close-settings") setSettingsOpen(false);
+      if (["slower", "faster"].includes(button.dataset.action)) {
+        const delta = button.dataset.action === "faster" ? 0.1 : -0.1;
+        changeWidgetSettings({ rate: Math.min(2, Math.max(0.7, Math.round((getPlaybackRate() + delta) * 10) / 10)) });
       }
 
       if (button.dataset.action === "play") {
@@ -826,31 +675,26 @@ function createPlayer() {
     });
 
     document.documentElement.append(playerElement);
-    scheduleNudgeDismissal();
+    window.setTimeout(() => playerElement?.classList.add("blog-listener-nudge-hidden"), 9000);
   }
 
   updatePlayer();
 }
 
-function scheduleNudgeDismissal() {
-  if (nudgeTimeoutId) {
-    window.clearTimeout(nudgeTimeoutId);
-  }
-
-  nudgeTimeoutId = window.setTimeout(() => {
-    hideNudge();
-  }, 9000);
-}
-
-function hideNudge() {
-  if (!playerElement) {
-    return;
-  }
-
-  playerElement.classList.add("blog-listener-nudge-hidden");
+function setSettingsOpen(open, restoreFocus = true) {
+  const panel = playerElement.querySelector(".blog-listener-settings");
+  if (panel.hidden === !open) return;
+  panel.hidden = !open;
+  const toggle = playerElement.querySelector("[data-action='settings']");
+  toggle.setAttribute("aria-expanded", String(open));
+  if (open) panel.querySelector("[data-action='close-settings']").focus();
+  else if (restoreFocus) toggle.focus();
 }
 
 async function playFromPageButton() {
+  // Unlock Web Audio during the page-button gesture, before loading settings.
+  try { await speechPlayback.ensureContext().resume(); }
+  catch (error) { setPlayerMessage(error.message); return; }
   const result = await chrome.storage.sync.get("speechSettings");
   playArticle(result.speechSettings || {});
 }
@@ -863,8 +707,36 @@ function setPlayerMessage(text) {
 }
 
 function updatePlayer() {
+  const preparation = speechPlayback.getPreparationStatus();
+  const playbackMessage = { type: "BLOG_LISTENER_PLAYBACK_STATE",
+    isPlaying: state.isPlaying, isPaused: state.isPaused, playbackStatus: state.playbackStatus || "idle", preparation,
+    settings: state.settings, voice: sessionVoice };
+  const signature = JSON.stringify(playbackMessage);
+  if (signature !== lastPlaybackMessage) {
+    lastPlaybackMessage = signature;
+    chrome.runtime.sendMessage(playbackMessage).catch(() => {});
+  }
+  if (playerElement) {
+    playerElement.querySelector(".blog-listener-playback-status").textContent =
+      preparationMessage();
+  }
   if (!playerElement) {
     return;
+  }
+
+  const settingsSignature = `${state.settings.voice}:${state.settings.rate}:${state.isPlaying}:${sessionVoice}`;
+  if (settingsSignature !== renderedSettings) {
+    renderedSettings = settingsSignature;
+    playerElement.querySelector(".blog-listener-rate").textContent = `${getPlaybackRate().toFixed(1)}×`;
+    playerElement.querySelector("[data-action='settings']").textContent = `${getPlaybackRate()}×`;
+    playerElement.querySelector("[data-action='slower']").disabled = getPlaybackRate() <= 0.7;
+    playerElement.querySelector("[data-action='faster']").disabled = getPlaybackRate() >= 2;
+    playerElement.querySelectorAll("input[name='blog-listener-voice']").forEach((input) => { input.checked = input.value === state.settings.voice; });
+    const voice = BlogListenerVoices.find((option) => option.id === (state.isPlaying ? sessionVoice : state.settings.voice));
+    playerElement.querySelector(".blog-listener-meta").textContent = `${voice.name} · AI voice`;
+    playerElement.querySelector(".blog-listener-settings-note").textContent = state.isPlaying
+      ? "Voice changes apply after Stop, then Play."
+      : "Voice descriptions are approximate.";
   }
 
   const playButton = playerElement.querySelector("[data-action='play']");
@@ -873,7 +745,11 @@ function updatePlayer() {
   const progressFill = playerElement.querySelector(".blog-listener-progress-fill");
   const isActivelyReading = state.isPlaying && !state.isPaused;
 
-  playButton.innerHTML = isActivelyReading ? ICONS.pause : ICONS.play;
+  const playbackIcon = isActivelyReading ? "pause" : "play";
+  if (playButton.dataset.playbackIcon !== playbackIcon) {
+    playButton.dataset.playbackIcon = playbackIcon;
+    playButton.innerHTML = ICONS[playbackIcon];
+  }
   playButton.title = isActivelyReading ? "Pause" : "Play";
   playButton.setAttribute("aria-label", isActivelyReading ? "Pause reading" : "Play article");
 
@@ -886,6 +762,7 @@ function updatePlayer() {
       adLinkElement.href = state.currentAd.url;
     } else {
       titleElement.textContent = `${state.title} (${state.chunkIndex + 1}/${state.chunks.length})`;
+      titleElement.title = titleElement.textContent;
       adLinkElement.textContent = "";
       adLinkElement.removeAttribute("href");
     }
@@ -905,6 +782,10 @@ function updatePlayer() {
     renderAdMarkers();
     progressFill.style.width = "0%";
   }
+}
+
+function preparationMessage() {
+  return state.isPlaying && state.playbackStatus === "buffering" ? "Buffering…" : "";
 }
 
 function getProgressPercent() {
@@ -948,6 +829,10 @@ function renderAdMarkers() {
   if (!markerLayer) {
     return;
   }
+
+  const signature = state.adMarkerPercents.join(",");
+  if (markerLayer.dataset.signature === signature) return;
+  markerLayer.dataset.signature = signature;
 
   markerLayer.textContent = "";
   state.adMarkerPercents.forEach((percent) => {
@@ -1003,6 +888,8 @@ function updateWordHighlight(chunk, chunkCharIndex, charLength = 1, updateContex
 
   const blockStart = (chunk.blockOffset || 0) + wordBounds.start;
   const blockEnd = (chunk.blockOffset || 0) + wordBounds.end;
+  if (updateContext && lastRenderedWord?.element === chunk.element &&
+      lastRenderedWord.start === blockStart && lastRenderedWord.end === blockEnd) return;
   const range = getNormalizedTextRange(chunk.element, blockStart, blockEnd);
 
   if (!range) {
@@ -1027,6 +914,7 @@ function updateWordHighlight(chunk, chunkCharIndex, charLength = 1, updateContex
   highlight.style.width = `${rectangle.width + horizontalPadding * 2}px`;
   highlight.style.height = `${rectangle.height + verticalPadding * 2}px`;
   highlight.hidden = false;
+  lastRenderedWord = { element: chunk.element, start: blockStart, end: blockEnd };
 }
 
 function getWordBounds(text, charIndex, charLength = 1) {
@@ -1068,91 +956,6 @@ function getWordRanges(text) {
     start: match.index,
     end: match.index + match[0].length
   }));
-}
-
-function startWordAdvanceTimer(chunk, offset, sessionId) {
-  stopWordAdvanceTimer();
-
-  const words = getWordRanges(chunk.text).filter((word) => word.end >= offset);
-  if (words.length === 0) {
-    return;
-  }
-
-  const wordIndex = Math.max(0, words.findIndex((word) => word.end >= offset));
-  wordAdvanceContext = {
-    chunk,
-    sessionId,
-    words,
-    wordIndex,
-    intervalMs: getEstimatedWordIntervalMs()
-  };
-
-  updateWordFromAdvanceContext();
-  wordAdvanceTimerId = window.setInterval(() => {
-    if (!wordAdvanceContext || state.sessionId !== wordAdvanceContext.sessionId || state.isPaused || state.isAdPlaying) {
-      return;
-    }
-
-    if (wordAdvanceContext.wordIndex < wordAdvanceContext.words.length - 1) {
-      wordAdvanceContext.wordIndex += 1;
-      updateWordFromAdvanceContext();
-    }
-  }, wordAdvanceContext.intervalMs);
-}
-
-function updateWordFromAdvanceContext() {
-  if (!wordAdvanceContext) {
-    return;
-  }
-
-  const word = wordAdvanceContext.words[wordAdvanceContext.wordIndex];
-  state.currentChunkCharIndex = word.start;
-  updateWordHighlight(wordAdvanceContext.chunk, word.start, word.end - word.start);
-  updatePlayer();
-}
-
-function syncWordAdvanceTimer(charIndex) {
-  if (!wordAdvanceContext) {
-    return;
-  }
-
-  const nextIndex = wordAdvanceContext.words.findIndex((word) => word.end >= charIndex);
-  if (nextIndex >= 0) {
-    wordAdvanceContext.wordIndex = nextIndex;
-  }
-}
-
-function resumeWordAdvanceTimer() {
-  if (!wordAdvanceContext || wordAdvanceTimerId) {
-    return;
-  }
-
-  wordAdvanceTimerId = window.setInterval(() => {
-    if (!wordAdvanceContext || state.sessionId !== wordAdvanceContext.sessionId || state.isPaused || state.isAdPlaying) {
-      return;
-    }
-
-    if (wordAdvanceContext.wordIndex < wordAdvanceContext.words.length - 1) {
-      wordAdvanceContext.wordIndex += 1;
-      updateWordFromAdvanceContext();
-    }
-  }, wordAdvanceContext.intervalMs);
-}
-
-function stopWordAdvanceTimer(clearContext = false) {
-  if (wordAdvanceTimerId) {
-    window.clearInterval(wordAdvanceTimerId);
-    wordAdvanceTimerId = null;
-  }
-
-  if (clearContext) {
-    wordAdvanceContext = null;
-  }
-}
-
-function getEstimatedWordIntervalMs() {
-  const rate = getPlaybackRate();
-  return Math.max(120, Math.round(60000 / (DEFAULT_WORDS_PER_MINUTE * rate)));
 }
 
 function getNormalizedTextRange(root, startIndex, endIndex) {
@@ -1219,6 +1022,7 @@ function getWordHighlightElement() {
 
 function hideWordHighlight() {
   currentWordHighlight = null;
+  lastRenderedWord = null;
 
   if (wordHighlightElement) {
     wordHighlightElement.hidden = true;
@@ -1235,7 +1039,7 @@ function scheduleWordHighlightReflow() {
     wordHighlightFrameId = null;
 
     if (highlight) {
-      updateWordHighlight(highlight.chunk, highlight.chunkCharIndex, highlight.charLength);
+      updateWordHighlight(highlight.chunk, highlight.chunkCharIndex, highlight.charLength, false);
     }
   });
 }
