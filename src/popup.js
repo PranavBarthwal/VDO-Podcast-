@@ -167,10 +167,10 @@ function updatePlaybackControls(status) {
     : "AI voices · Descriptions are approximate.";
   pauseButton.textContent = status.isPaused ? "Resume" : "Pause";
   pauseButton.disabled = !status.isPlaying;
-  stopButton.disabled = !status.isPlaying;
-  playButton.disabled = status.isPlaying && !status.isPaused;
-  message.textContent = status.isPaused ? "Paused." : status.playbackStatus === "buffering"
-    ? "Buffering…" : status.isPlaying ? `Playing with ${BlogListenerVoices.find((voice) => voice.id === status.voice)?.name || "Ash"}.` : "";
+  stopButton.disabled = !status.isPlaying && !status.briefLoading;
+  playButton.disabled = status.briefLoading || (status.isPlaying && !status.isPaused);
+  message.textContent = status.briefLoading ? "Creating AI Brief…" : status.isPaused ? "Paused." : status.playbackStatus === "buffering"
+    ? "Buffering…" : status.isPlaying ? `${status.mode === "brief" ? "Playing AI Brief" : "Playing"} with ${BlogListenerVoices.find((voice) => voice.id === status.voice)?.name || "Ash"}.` : "";
   const preparation = status.preparation;
   if (!status.isPlaying && preparation?.error) message.textContent = "Preparation failed. Press Play to retry.";
 }

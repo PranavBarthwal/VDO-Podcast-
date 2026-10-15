@@ -53,6 +53,23 @@ async function test() {
   });
   await background.generateSpeech("Another voice.", undefined, "nova");
   assert.equal(JSON.parse(request.body).voice, "nova", "Selected voice reaches the speech API");
+  const initialFetch = offscreen.fetch;
+  const articleText = "A long article explains its central finding and the context around it. ".repeat(4);
+  offscreen.fetch = async (url, options) => {
+    request = { url, ...options };
+    return { ok: true, status: 200, json: async () => ({ status: "completed",
+      output: [{ content: [{ type: "output_text", text: "A clear medium-length summary." }] }] }) };
+  };
+  const brief = await background.generateBrief("Article title", articleText, new AbortController().signal);
+  assert.equal(brief.summary, "A clear medium-length summary.");
+  assert.equal(request.url, "https://api.openai.com/v1/responses");
+  const briefBody = JSON.parse(request.body);
+  assert.equal(briefBody.model, "gpt-4o-mini");
+  assert.equal(briefBody.store, false);
+  assert.equal(briefBody.max_output_tokens, 500);
+  assert(briefBody.input.includes(articleText));
+  await assert.rejects(background.generateBrief("Title", "Short", new AbortController().signal), /too short/);
+  offscreen.fetch = initialFetch;
   await assert.rejects(background.generateSpeech("Hello", undefined, "invalid"), /supported voice/);
   await assert.rejects(background.generateSpeech("x".repeat(4097)), /4096/);
   key = "";
@@ -95,10 +112,23 @@ async function test() {
   assert.equal(cancelled.ok, true);
   assert.equal(signal.aborted, true);
   assert.equal(response.ok, false);
+  signal = null;
+  let briefResponse;
+  listener({ type: "BLOG_LISTENER_GENERATE_BRIEF", title: "Article title", text: articleText, requestId: "brief-cancel-test" }, sender,
+    (value) => { briefResponse = value; });
+  await new Promise(setImmediate);
+  assert(signal && !signal.aborted);
+  let briefCancelled;
+  listener({ type: "BLOG_LISTENER_CANCEL_BRIEF", requestId: "brief-cancel-test" }, sender,
+    (value) => { briefCancelled = value; });
+  await new Promise(setImmediate);
+  assert.equal(briefCancelled.ok, true);
+  assert.equal(signal.aborted, true);
+  assert.equal(briefResponse.ok, false);
   assert(timeouts.every((ms) => ms === 120000));
   assert.equal(documentsCreated, 1, "Reuse the hidden speech document");
   assert.equal(heartbeatCount, 0, "Stop keep-alive messages after requests finish");
-  console.log("Speech API checks passed: two-minute timeout, offscreen routing, model, voice, limits, credentials, sender validation and request cancellation.");
+  console.log("Speech API checks passed: TTS and AI Brief routing, model, voice, limits, credentials, sender validation and request cancellation.");
 }
 
 test().catch((error) => { console.error(error); process.exitCode = 1; });

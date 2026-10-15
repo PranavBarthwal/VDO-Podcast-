@@ -2,6 +2,7 @@ importScripts("voices.js");
 const TTS_MODEL = "gpt-4o-mini-tts-2025-12-15";
 const TTS_VOICE = "ash";
 const speechRequests = new Map();
+const briefRequests = new Map();
 let offscreenCreation = null;
 let offscreenRequestSequence = 0;
 
@@ -26,7 +27,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: true });
     return false;
   }
-  if (!["BLOG_LISTENER_GENERATE_SPEECH", "BLOG_LISTENER_CANCEL_SPEECH"].includes(message?.type)) return false;
+  const isBrief = ["BLOG_LISTENER_GENERATE_BRIEF", "BLOG_LISTENER_CANCEL_BRIEF"].includes(message?.type);
+  if (!isBrief && !["BLOG_LISTENER_GENERATE_SPEECH", "BLOG_LISTENER_CANCEL_SPEECH"].includes(message?.type)) return false;
   if (sender.id !== chrome.runtime.id || !sender.tab || !/^https?:\/\//.test(sender.url || "")) {
     sendResponse({ ok: false, error: "Speech requests must come from an article tab." });
     return false;
@@ -36,6 +38,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   const key = `${sender.tab.id}:${sender.documentId || sender.frameId || 0}:${message.requestId}`;
+  if (isBrief) {
+    if (message.type === "BLOG_LISTENER_CANCEL_BRIEF") {
+      briefRequests.get(key)?.controller.abort();
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (briefRequests.has(key)) {
+      sendResponse({ ok: false, error: "AI Brief is already being generated." });
+      return false;
+    }
+    const controller = new AbortController();
+    briefRequests.set(key, { controller, tabId: sender.tab.id });
+    generateBrief(message.title, message.text, controller.signal).then(sendResponse).catch((error) => {
+      sendResponse({ ok: false, error: error.name === "TimeoutError" ? "AI Brief timed out. Try again." : error.message });
+    }).finally(() => briefRequests.delete(key));
+    return true;
+  }
   if (message.type === "BLOG_LISTENER_CANCEL_SPEECH") {
     speechRequests.get(key)?.controller.abort();
     sendResponse({ ok: true });
@@ -55,6 +74,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   for (const request of speechRequests.values()) if (request.tabId === tabId) request.controller.abort();
+  for (const request of briefRequests.values()) if (request.tabId === tabId) request.controller.abort();
 });
 
 async function ensureSpeechDocument() {
@@ -93,5 +113,31 @@ async function generateSpeech(text, signal, voice = TTS_VOICE) {
     return result;
   } finally {
     signal?.removeEventListener("abort", cancel);
+  }
+}
+
+async function generateBrief(title, text, signal) {
+  if (typeof title !== "string" || title.length > 500 || typeof text !== "string" ||
+      text.trim().length < 80 || text.length > 60000) {
+    throw new Error("This article is too short or too long for AI Brief.");
+  }
+  await storageReady;
+  signal.throwIfAborted();
+  const { openaiApiKey } = await chrome.storage.local.get("openaiApiKey");
+  if (!openaiApiKey) throw new Error("Add your OpenAI API key in the extension popup.");
+  await ensureSpeechDocument();
+  signal.throwIfAborted();
+  const requestId = `brief:${++offscreenRequestSequence}`;
+  const cancel = () => chrome.runtime.sendMessage({ target: "speech-offscreen",
+    type: "BLOG_LISTENER_OFFSCREEN_CANCEL_BRIEF", requestId }).catch(() => {});
+  signal.addEventListener("abort", cancel, { once: true });
+  try {
+    const result = await chrome.runtime.sendMessage({ target: "speech-offscreen",
+      type: "BLOG_LISTENER_OFFSCREEN_GENERATE_BRIEF", requestId, title, text, apiKey: openaiApiKey });
+    signal.throwIfAborted();
+    if (!result?.ok) throw new Error(result?.error || "Could not create AI Brief.");
+    return { ok: true, summary: result.summary };
+  } finally {
+    signal.removeEventListener("abort", cancel);
   }
 }

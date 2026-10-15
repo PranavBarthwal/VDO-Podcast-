@@ -9,6 +9,7 @@ const MIN_ARTICLE_WORDS = 80;
 const MAX_UTTERANCE_CHARS = 1800;
 const AD_BREAK_INTERVAL = 4;
 const SEEK_SECONDS = 5;
+const MAX_BRIEF_ARTICLE_CHARS = 60000;
 const SIMULATED_ADS = [
   {
     title: "Blog Listener Pro",
@@ -93,6 +94,7 @@ const state = {
   isAdPlaying: false,
   adBreaksPlayed: new Set(),
   title: "",
+  mode: "idle",
   sessionId: 0,
   settings: {
     rate: 1,
@@ -117,6 +119,8 @@ let preloadCheckAgain = false;
 let speechConfigured = null;
 let sessionVoice = "ash";
 let renderedSettings = "";
+let briefRequestSequence = 0;
+let activeBriefRequestId = null;
 
 const speechPlayback = new BlogAudioPlayer({
   requestAudio: (text, requestId) => chrome.runtime.sendMessage({
@@ -128,6 +132,13 @@ const speechPlayback = new BlogAudioPlayer({
   onPosition: (segment, _index, seconds, duration) => {
     const charIndex = duration ? Math.min(segment.text.length - 1,
       Math.floor(seconds / duration * segment.text.length)) : 0;
+    if (state.mode === "brief") {
+      state.chunkIndex = segment.chunkIndex;
+      state.currentChunkCharIndex = charIndex;
+      state.isAdPlaying = false;
+      updatePlayer();
+      return;
+    }
     const changed = state.chunkIndex !== segment.chunkIndex || state.isAdPlaying !== !!segment.ad;
     state.chunkIndex = segment.chunkIndex;
     state.isAdPlaying = !!segment.ad;
@@ -150,7 +161,7 @@ const speechPlayback = new BlogAudioPlayer({
     updatePlayer();
   },
   onPreparation: () => updatePlayer(),
-  onFinish: () => { stopArticle(false); setPlayerMessage("Finished"); },
+  onFinish: () => { const wasBrief = state.mode === "brief"; stopArticle(false); setPlayerMessage(wasBrief ? "AI Brief finished" : "Finished"); },
   onError: (error) => { stopArticle(false); setPlayerMessage(error.message || "Speech playback stopped"); }
 });
 
@@ -175,6 +186,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       canRead: article.wordCount >= MIN_ARTICLE_WORDS,
       isPlaying: state.isPlaying,
       isPaused: state.isPaused,
+      briefLoading: state.mode === "brief-loading",
+      mode: state.mode,
       playbackStatus: state.playbackStatus || "idle",
       settings: state.settings, voice: sessionVoice,
       preparation: speechPlayback.getPreparationStatus()
@@ -287,6 +300,7 @@ async function preloadArticle() {
 }
 
 function playArticle(settings = {}) {
+  if (state.mode === "brief-loading") stopArticle();
   applySpeechSettings(settings);
   if (state.isPaused) { resumeArticle(); return; }
   if (state.isPlaying) return;
@@ -298,6 +312,7 @@ function playArticle(settings = {}) {
   preloadGeneration++;
   speechPlayback.refreshPreparation(articleSegments(article), getPlaybackRate());
   state.sessionId++;
+  state.mode = "article";
   state.title = article.title;
   state.chunks = article.chunks;
   state.adMarkerPercents = getAdMarkerPercents(article.chunks);
@@ -305,6 +320,63 @@ function playArticle(settings = {}) {
   state.isPlaying = true;
   speechPlayback.startPrepared(getPlaybackRate());
   updatePlayer();
+}
+
+async function startBrief() {
+  if (state.isPlaying || state.mode === "brief-loading") return;
+  const article = extractArticle();
+  if (article.wordCount < MIN_ARTICLE_WORDS) {
+    setPlayerMessage("No readable article found");
+    return;
+  }
+  const text = article.text.length > MAX_BRIEF_ARTICLE_CHARS
+    ? `${article.text.slice(0, 45000)} … ${article.text.slice(-14997)}`
+    : article.text;
+  const requestId = `brief:${++briefRequestSequence}`;
+  const sessionId = ++state.sessionId;
+  activeBriefRequestId = requestId;
+  state.mode = "brief-loading";
+  state.title = article.title;
+  preloadAllowed = false;
+  preloadObserver?.disconnect();
+  preloadObserver = null;
+  if (preloadTimer !== null) window.clearTimeout(preloadTimer);
+  preloadTimer = null;
+  preloadGeneration++;
+  speechPlayback.stop();
+  clearReadingState();
+  updatePlayer();
+  try {
+    await speechPlayback.ensureContext().resume();
+    const { speechSettings } = await chrome.storage.sync.get("speechSettings");
+    if (sessionId !== state.sessionId || state.mode !== "brief-loading") return;
+    applySpeechSettings(speechSettings || {});
+    const result = await chrome.runtime.sendMessage({
+      type: "BLOG_LISTENER_GENERATE_BRIEF", requestId, title: article.title, text
+    });
+    if (sessionId !== state.sessionId || activeBriefRequestId !== requestId) return;
+    if (!result?.ok) throw new Error(result?.error || "Could not create AI Brief.");
+    const summary = normalizeText(result.summary);
+    if (!summary) throw new Error("AI Brief returned no summary. Try again.");
+    const chunks = splitTextIntoChunks(summary).map((chunk) => ({ text: chunk.text }));
+    activeBriefRequestId = null;
+    state.mode = "brief";
+    state.title = `AI Brief · ${article.title}`;
+    state.chunks = chunks;
+    state.totalChars = chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+    state.adMarkerPercents = [];
+    state.chunkIndex = 0;
+    state.currentChunkCharIndex = 0;
+    state.isPlaying = true;
+    state.isPaused = false;
+    speechPlayback.prepare(chunks.map((chunk, index) => ({ ...chunk, chunkIndex: index, paragraphIndex: index })), getPlaybackRate());
+    speechPlayback.startPrepared(getPlaybackRate());
+    updatePlayer();
+  } catch (error) {
+    if (sessionId !== state.sessionId) return;
+    stopArticle(false);
+    setPlayerMessage(error.message || "Could not create AI Brief.");
+  }
 }
 
 function pauseArticle() {
@@ -327,6 +399,10 @@ function seekPlayback(direction) {
 
 function stopArticle(hidePlayer = true) {
   if (playerElement) setSettingsOpen(false, false);
+  if (activeBriefRequestId) {
+    chrome.runtime.sendMessage({ type: "BLOG_LISTENER_CANCEL_BRIEF", requestId: activeBriefRequestId }).catch(() => {});
+    activeBriefRequestId = null;
+  }
   preloadAllowed = false;
   preloadObserver?.disconnect();
   preloadObserver = null;
@@ -334,6 +410,7 @@ function stopArticle(hidePlayer = true) {
   preloadTimer = null;
   preloadGeneration++;
   state.sessionId += 1;
+  state.mode = "idle";
   speechPlayback.stop();
   state.isPlaying = false;
   state.isPaused = false;
@@ -606,6 +683,7 @@ function createPlayer() {
       </span>
       <button class="blog-listener-button blog-listener-secondary" type="button" data-action="rewind" title="Back 5 seconds" aria-label="Go back 5 seconds">${ICONS.rewind5}</button>
       <button class="blog-listener-button blog-listener-primary" type="button" data-action="play" title="Play" aria-label="Play article">${ICONS.play}</button>
+      <button class="blog-listener-brief-button" type="button" data-action="brief" title="Summarize and listen to this article" aria-label="Create and listen to an AI brief"><span aria-hidden="true">✦</span> AI Brief</button>
       <button class="blog-listener-button blog-listener-secondary" type="button" data-action="forward" title="Skip forward 5 seconds" aria-label="Skip forward 5 seconds">${ICONS.forward5}</button>
       <button class="blog-listener-button blog-listener-settings-toggle" type="button" data-action="settings" title="Speed and voice" aria-label="Speed and voice settings" aria-expanded="false" aria-controls="blog-listener-settings">1×</button>
       <button class="blog-listener-button blog-listener-stop" type="button" data-action="stop" title="Stop" aria-label="Stop reading">${ICONS.stop}</button>
@@ -641,6 +719,7 @@ function createPlayer() {
       }
 
       if (button.dataset.action === "settings") setSettingsOpen(button.getAttribute("aria-expanded") !== "true");
+      if (button.dataset.action === "brief") startBrief();
       if (button.dataset.action === "close-settings") setSettingsOpen(false);
       if (["slower", "faster"].includes(button.dataset.action)) {
         const delta = button.dataset.action === "faster" ? 0.1 : -0.1;
@@ -709,7 +788,8 @@ function setPlayerMessage(text) {
 function updatePlayer() {
   const preparation = speechPlayback.getPreparationStatus();
   const playbackMessage = { type: "BLOG_LISTENER_PLAYBACK_STATE",
-    isPlaying: state.isPlaying, isPaused: state.isPaused, playbackStatus: state.playbackStatus || "idle", preparation,
+    isPlaying: state.isPlaying, isPaused: state.isPaused, briefLoading: state.mode === "brief-loading", mode: state.mode,
+    playbackStatus: state.playbackStatus || "idle", preparation,
     settings: state.settings, voice: sessionVoice };
   const signature = JSON.stringify(playbackMessage);
   if (signature !== lastPlaybackMessage) {
@@ -724,7 +804,7 @@ function updatePlayer() {
     return;
   }
 
-  const settingsSignature = `${state.settings.voice}:${state.settings.rate}:${state.isPlaying}:${sessionVoice}`;
+  const settingsSignature = `${state.settings.voice}:${state.settings.rate}:${state.isPlaying}:${sessionVoice}:${state.mode}`;
   if (settingsSignature !== renderedSettings) {
     renderedSettings = settingsSignature;
     playerElement.querySelector(".blog-listener-rate").textContent = `${getPlaybackRate().toFixed(1)}×`;
@@ -733,7 +813,7 @@ function updatePlayer() {
     playerElement.querySelector("[data-action='faster']").disabled = getPlaybackRate() >= 2;
     playerElement.querySelectorAll("input[name='blog-listener-voice']").forEach((input) => { input.checked = input.value === state.settings.voice; });
     const voice = BlogListenerVoices.find((option) => option.id === (state.isPlaying ? sessionVoice : state.settings.voice));
-    playerElement.querySelector(".blog-listener-meta").textContent = `${voice.name} · AI voice`;
+    playerElement.querySelector(".blog-listener-meta").textContent = state.mode === "brief-loading" ? "AI Brief" : state.mode === "brief" ? `${voice.name} · AI Brief` : `${voice.name} · AI voice`;
     playerElement.querySelector(".blog-listener-settings-note").textContent = state.isPlaying
       ? "Voice changes apply after Stop, then Play."
       : "Voice descriptions are approximate.";
@@ -753,7 +833,13 @@ function updatePlayer() {
   playButton.title = isActivelyReading ? "Pause" : "Play";
   playButton.setAttribute("aria-label", isActivelyReading ? "Pause reading" : "Play article");
 
-  if (state.isPlaying && state.chunks.length > 0) {
+  if (state.mode === "brief-loading") {
+    playerElement.classList.remove("blog-listener-idle");
+    playerElement.classList.add("blog-listener-brief-loading");
+    titleElement.textContent = "Creating AI Brief…";
+    progressFill.style.width = "0%";
+  } else if (state.isPlaying && state.chunks.length > 0) {
+    playerElement.classList.remove("blog-listener-brief-loading");
     playerElement.classList.remove("blog-listener-idle");
     playerElement.classList.toggle("blog-listener-ad-mode", state.isAdPlaying);
     if (state.isAdPlaying && state.currentAd) {
@@ -769,6 +855,7 @@ function updatePlayer() {
     renderAdMarkers();
     progressFill.style.width = `${getProgressPercent()}%`;
   } else if (!titleElement.textContent || titleElement.textContent === state.title) {
+    playerElement.classList.remove("blog-listener-brief-loading");
     playerElement.classList.add("blog-listener-idle");
     playerElement.classList.remove("blog-listener-ad-mode");
     adLinkElement.textContent = "";
@@ -776,6 +863,7 @@ function updatePlayer() {
     renderAdMarkers();
     progressFill.style.width = "0%";
   } else {
+    playerElement.classList.remove("blog-listener-brief-loading");
     playerElement.classList.remove("blog-listener-ad-mode");
     adLinkElement.textContent = "";
     adLinkElement.removeAttribute("href");
